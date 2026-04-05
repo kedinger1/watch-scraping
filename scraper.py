@@ -804,6 +804,9 @@ SCRAPERS = [
     ("G&G Timepieces",         lambda s: scrape_shopify_store(
         s, "https://gandgtimepieces.com", "G&G Timepieces"
     )),
+    ("WatchX NYC",             lambda s: scrape_shopify_store(
+        s, "https://watchxnyc.com", "WatchX NYC"
+    )),
     ("Hodinkee Shop",          lambda s: scrape_shopify_store(
         s, "https://shop.hodinkee.com", "Hodinkee Shop"
     )),
