@@ -536,11 +536,17 @@ def scrape_european_watch_co(session: requests.Session) -> list[Listing]:
 # ── WristCheck ─────────────────────────────────────────────────────────────────
 def scrape_wristcheck(session: requests.Session) -> list[Listing]:
     """
-    WristCheck (wristcheck.com) is a JS-rendered React app — Playwright required.
+    WristCheck (wristcheck.com) is JS-rendered — Playwright collects listing URLs
+    and cover images from the brand page. The accurate watch title is pulled from
+    each listing's server-rendered <title> tag via a lightweight requests.get().
+
     Brand pages:
       https://wristcheck.com/us/buy/f-p-journe
       https://wristcheck.com/us/buy/de-bethune
     Individual listings: /us/buy/{brand}/{model-slug}
+
+    Server-rendered title format:
+      "F.P. Journe Octa Automatique ... - Make an offer | Wristcheck"
     """
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
@@ -562,16 +568,15 @@ def scrape_wristcheck(session: requests.Session) -> list[Listing]:
         for brand, url in pages_to_visit:
             try:
                 page.goto(url, wait_until="networkidle", timeout=45_000)
-                # WristCheck listing cards link to /us/buy/{brand}/{model}
+                # WristCheck listing cards link to /us/buy/{brand}/{model-slug}
                 page.wait_for_selector('a[href*="/us/buy/"]', timeout=20_000)
 
                 items = page.evaluate("""() => {
                     const seen = new Set();
                     const results = [];
-                    // Listing links go deeper than the brand root (/us/buy/brand/model)
                     document.querySelectorAll('a[href*="/us/buy/"]').forEach(a => {
                         const href = a.href;
-                        // Skip the brand root page links (only want model-level pages)
+                        // Skip brand root links — only want model-level pages (2+ segments after /us/buy/)
                         const parts = href.split('/us/buy/')[1] || '';
                         if (!parts.includes('/')) return;
                         if (seen.has(href)) return;
@@ -594,20 +599,47 @@ def scrape_wristcheck(session: requests.Session) -> list[Listing]:
                     return results;
                 }""")
 
-                log.info("WristCheck %s: %d listings", brand, len(items))
+                log.info("WristCheck %s: %d listings found", brand, len(items))
 
                 for item in items:
+                    listing_url = item.get("url", "")
                     texts = item.get("texts", [])
-                    title = next((t for t in texts if len(t) > 6), "Unknown")
+
+                    # Fetch the individual listing page to get the server-rendered title.
+                    # WristCheck SSR populates <title> with the full model name.
+                    title = "Unknown"
+                    if listing_url:
+                        detail = fetch(listing_url, session)
+                        if detail:
+                            m = re.search(
+                                r"<title>(.*?)</title>",
+                                detail.text,
+                                re.DOTALL | re.IGNORECASE,
+                            )
+                            if m:
+                                raw = m.group(1).strip()
+                                # Strip " - Make an offer | Wristcheck" and similar suffixes
+                                title = re.sub(
+                                    r"\s*[-–]\s*(Make an offer[^|]*)\s*\|.*$",
+                                    "",
+                                    raw,
+                                    flags=re.IGNORECASE,
+                                ).strip()
+                        time.sleep(0.3)
+
+                    # Fall back to card text if title fetch failed
+                    if title == "Unknown":
+                        title = next((t for t in texts if len(t) > 6), "Unknown")
+
                     price = next(
                         (t for t in texts if "$" in t and any(c.isdigit() for c in t)),
-                        "—"
+                        "—",
                     )
                     listings.append(Listing(
                         title=title,
                         price=price,
                         image_url=item.get("imageUrl", ""),
-                        listing_url=item.get("url", ""),
+                        listing_url=listing_url,
                         source="WristCheck",
                         brand=brand,
                     ))
@@ -625,14 +657,25 @@ def scrape_wristcheck(session: requests.Session) -> list[Listing]:
 # ── Bezel ──────────────────────────────────────────────────────────────────────
 def scrape_bezel(session: requests.Session) -> list[Listing]:
     """
-    Bezel (shop.getbezel.com) is a fully JS-rendered React/Plasmic app —
-    requests+BS4 returns an empty shell. We use Playwright (headless Chromium)
-    to execute the JavaScript and pull the rendered listing cards.
+    Bezel (shop.getbezel.com) two-phase approach:
 
-    Brand listing pages:
-      https://shop.getbezel.com/explore/fp-journe
-      https://shop.getbezel.com/explore/de-bethune
-    Individual listing URLs follow: /watches/{brand}/{model}/ref-{ref}/id-{id}
+    Phase 1 — Playwright loads the explore pages and collects model-page URLs.
+      Explore pages: /explore/fp-journe, /explore/de-bethune
+      Model pages end with /id-{model_id}  (one page per reference/watch model)
+
+    Phase 2 — Each model page is fetched statically (no Playwright needed).
+      Bezel embeds full listing data in a <script id="__NEXT_DATA__"> tag:
+        props.pageProps.listings[]
+          .id             → individual listing ID
+          .model.name     → model name (e.g. "Octa Automatique Reserve Lune")
+          .manufactureYear→ year (e.g. 2024)
+          .priceCents     → price in cents
+          .status         → "PUBLISHED" = active
+          .active         → bool
+          .images[]       → listing-specific photos (bunnyUrl / cloudinaryUrl)
+
+    Individual listing URL: /watches/{brand}/{model}/ref-{ref}/listing/id-{listing_id}
+    Full title:  "{year} {Brand Display} {model.name}"
     """
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
@@ -643,78 +686,133 @@ def scrape_bezel(session: requests.Session) -> list[Listing]:
         )
         return []
 
-    listings: list[Listing] = []
-    pages_to_visit = [
-        ("FP Journe",  "https://shop.getbezel.com/explore/fp-journe"),
-        ("De Bethune", "https://shop.getbezel.com/explore/de-bethune"),
+    BASE = "https://shop.getbezel.com"
+    explore_pages = [
+        ("FP Journe",  f"{BASE}/explore/fp-journe",  "F.P. Journe"),
+        ("De Bethune", f"{BASE}/explore/de-bethune", "De Bethune"),
     ]
+
+    # ── Phase 1: collect model-page URLs via Playwright ──────────────────────
+    # Each entry: (brand_key, brand_display, model_page_url)
+    model_pages: list[tuple[str, str, str]] = []
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         ctx = browser.new_context(user_agent=HEADERS["User-Agent"])
         page = ctx.new_page()
 
-        for brand, url in pages_to_visit:
+        for brand, explore_url, brand_display in explore_pages:
             try:
-                page.goto(url, wait_until="networkidle", timeout=45_000)
-                # Wait until at least one watch link renders
+                page.goto(explore_url, wait_until="networkidle", timeout=45_000)
                 page.wait_for_selector('a[href*="/watches/"]', timeout=20_000)
 
-                # Extract every listing card via JS — avoids fragile class-name selectors
-                items = page.evaluate("""() => {
+                hrefs = page.evaluate("""() => {
                     const seen = new Set();
                     const results = [];
                     document.querySelectorAll('a[href*="/watches/"]').forEach(a => {
                         const href = a.href;
+                        // Model pages end with /id-{number} (not /listing/id-{number})
+                        if (!/\\/id-\\d+$/.test(href)) return;
                         if (seen.has(href)) return;
                         seen.add(href);
-                        // Walk up to find a card-like container
-                        const card = a.closest('li, article, section, [class*="card"], [class*="item"], [class*="tile"]') || a;
-                        const img = card.querySelector('img');
-                        // Collect all leaf-node text snippets
-                        const texts = [];
-                        card.querySelectorAll('*').forEach(el => {
-                            if (el.children.length === 0) {
-                                const t = el.textContent.trim();
-                                if (t) texts.push(t);
-                            }
-                        });
-                        results.push({
-                            url:      href,
-                            imageUrl: img ? (img.src || img.dataset.src || img.dataset.lazySrc || '') : '',
-                            texts:    texts,
-                        });
+                        results.push(href);
                     });
                     return results;
                 }""")
 
-                log.info("Bezel %s: %d listings", brand, len(items))
-
-                for item in items:
-                    texts = item.get("texts", [])
-                    # First non-trivial text is usually the title
-                    title = next((t for t in texts if len(t) > 6), "Unknown")
-                    # Price: contains $ and at least one digit
-                    price = next(
-                        (t for t in texts if "$" in t and any(c.isdigit() for c in t)),
-                        "—"
-                    )
-                    listings.append(Listing(
-                        title=title,
-                        price=price,
-                        image_url=item.get("imageUrl", ""),
-                        listing_url=item.get("url", ""),
-                        source="Bezel",
-                        brand=brand,
-                    ))
+                log.info("Bezel explore %s: %d model pages", brand, len(hrefs))
+                for href in hrefs:
+                    model_pages.append((brand, brand_display, href))
 
             except PwTimeout:
-                log.warning("Bezel timed out for %s — page may not have loaded", brand)
+                log.warning("Bezel explore timed out for %s", brand)
             except Exception as exc:
-                log.warning("Bezel error for %s: %s", brand, exc)
+                log.warning("Bezel explore error for %s: %s", brand, exc)
 
         browser.close()
 
+    # ── Phase 2: parse __NEXT_DATA__ from each model page ────────────────────
+    listings: list[Listing] = []
+
+    for brand, brand_display, model_url in model_pages:
+        resp = fetch(model_url, session)
+        if not resp:
+            continue
+
+        try:
+            m = re.search(
+                r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>',
+                resp.text,
+                re.DOTALL,
+            )
+            if not m:
+                log.warning("Bezel: no __NEXT_DATA__ at %s", model_url)
+                continue
+            data = json.loads(m.group(1))
+            raw_listings = (
+                data.get("props", {}).get("pageProps", {}).get("listings", [])
+            )
+        except Exception as exc:
+            log.warning("Bezel: JSON parse error at %s: %s", model_url, exc)
+            continue
+
+        # Base URL for constructing individual listing URLs:
+        # strip trailing /id-{model_id}, append /listing/id-{listing_id}
+        url_base = re.sub(r"/id-\d+$", "", model_url)
+
+        for lst in raw_listings:
+            if not lst.get("active") or lst.get("status") != "PUBLISHED":
+                continue
+
+            listing_id = lst.get("id")
+            if not listing_id:
+                continue
+
+            model_info = lst.get("model", {})
+            model_name = model_info.get("name", "")
+            year = lst.get("manufactureYear", "")
+
+            # Build full title: "2024 F.P. Journe Octa Automatique Reserve Lune"
+            title_parts = [str(year) if year else "", brand_display, model_name]
+            title = " ".join(p for p in title_parts if p).strip()
+
+            price_cents = lst.get("priceCents") or 0
+            price = f"${price_cents / 100:,.0f}" if price_cents else "—"
+
+            # Prefer listing-specific images; fall back to model-level images
+            img_url = ""
+            for img_obj in lst.get("images", []):
+                img = img_obj.get("image", {})
+                img_url = (
+                    img.get("bunnyUrl")
+                    or img.get("cloudinaryUrl")
+                    or img.get("rawUrl", "")
+                )
+                if img_url:
+                    break
+            if not img_url:
+                for img_obj in model_info.get("images", []):
+                    img_url = (
+                        img_obj.get("bunnyUrl")
+                        or img_obj.get("cloudinaryUrl")
+                        or img_obj.get("url", "")
+                    )
+                    if img_url:
+                        break
+
+            listing_url = f"{url_base}/listing/id-{listing_id}"
+            listings.append(Listing(
+                title=title,
+                price=price,
+                image_url=img_url,
+                listing_url=listing_url,
+                source="Bezel",
+                brand=brand,
+            ))
+
+        time.sleep(0.5)
+
+    log.info("Bezel total: %d individual listings", len(listings))
     return deduplicate(listings)
 
 
