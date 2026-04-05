@@ -101,7 +101,7 @@ For GitHub Actions, add all five as **repository secrets** under
 
 ### 3. Schedule
 
-The workflow runs automatically every day at **8:00 AM Mountain Time** (14:00 UTC).
+The workflow runs automatically every day at **7:30 AM EST** (12:30 UTC).
 You can also trigger it manually via the **"Run workflow"** button in the Actions tab.
 
 ---
