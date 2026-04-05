@@ -304,6 +304,13 @@ def scrape_shopify_store(
                     continue
 
                 variants = p.get("variants", [])
+
+                # Skip sold-out listings — Shopify sets available=false on
+                # every variant when sold; price "0.00" is a secondary signal.
+                available = any(v.get("available", False) for v in variants)
+                if not available:
+                    continue
+
                 price = "—"
                 if variants:
                     raw = variants[0].get("price", "")
