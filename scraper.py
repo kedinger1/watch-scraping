@@ -77,6 +77,17 @@ class Listing:
         return self.listing_url.split("?")[0].rstrip("/")
 
 
+@dataclass
+class AuctionLot:
+    title: str          # "F.P. Journe Centigraphe Souverain"
+    estimate: str       # "$80,000 – $160,000"
+    sale_date: str      # "April 8, 2026"
+    sale_location: str  # "New York" | "Geneva" | "Hong Kong"
+    image_url: str
+    lot_url: str
+    brand: str          # "FP Journe" | "De Bethune"
+
+
 def detect_brand(text: str) -> Optional[str]:
     """Return 'FP Journe' or 'De Bethune' if the text matches, else None."""
     t = text.lower()
@@ -779,6 +790,140 @@ def scrape_watches_of_switzerland(session: requests.Session) -> list[Listing]:
     return deduplicate(listings)
 
 
+# ── Phillips Auction ───────────────────────────────────────────────────────────
+_PHILLIPS_LOCATIONS = {"NY": "New York", "CH": "Geneva", "HK": "Hong Kong",
+                       "LO": "London",  "AU": "Auckland"}
+
+
+def _phillips_sale_location(sale_number: str) -> str:
+    return _PHILLIPS_LOCATIONS.get(sale_number[:2].upper(), "Phillips")
+
+
+def _phillips_parse_date(iso: str) -> str:
+    """'2026-04-08T16:00:00+00:00'  →  'April 8, 2026'"""
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(iso)
+        return dt.strftime("%B %-d, %Y")   # Linux/Mac
+    except ValueError:
+        try:
+            return dt.strftime("%B %#d, %Y")  # Windows
+        except Exception:
+            return iso[:10]
+    except Exception:
+        return iso[:10]
+
+
+def _phillips_extract_upcoming(html: str) -> list[dict]:
+    """
+    Phillips artist pages embed all lot data as a JSON string inside a React
+    component prop.  The key sequence is always:
+      "upcomingLots" … "data" … [  { lot objects }  ]
+    We un-escape the JS string layer, locate the array, then parse it.
+    """
+    text = html.replace('\\"', '"').replace('\\\\', '\\')
+
+    key = '"upcomingLots"'
+    start = text.find(key)
+    if start == -1:
+        return []
+
+    # Find the "data" key inside the upcomingLots object
+    data_key = text.find('"data"', start)
+    if data_key == -1:
+        return []
+
+    arr_start = text.find('[', data_key)
+    if arr_start == -1:
+        return []
+
+    # Match brackets
+    depth, in_str, esc, arr_end = 0, False, False, arr_start
+    for i in range(arr_start, min(arr_start + 200_000, len(text))):
+        c = text[i]
+        if esc:
+            esc = False; continue
+        if c == '\\' and in_str:
+            esc = True; continue
+        if c == '"':
+            in_str = not in_str
+        elif not in_str:
+            if c == '[': depth += 1
+            elif c == ']':
+                depth -= 1
+                if depth == 0:
+                    arr_end = i + 1; break
+
+    try:
+        return json.loads(text[arr_start:arr_end])
+    except json.JSONDecodeError:
+        return []
+
+
+def scrape_phillips(session: requests.Session) -> list[AuctionLot]:
+    """
+    Phillips artist pages for FP Journe and De Bethune.
+    Data is server-embedded JSON — no Playwright needed.
+    Only returns lots where isSaleOver is false (upcoming).
+    """
+    BASE = "https://www.phillips.com"
+    pages = [
+        ("FP Journe",  f"{BASE}/artist/13096/f-p-journe"),
+        ("De Bethune", f"{BASE}/artist/13224/de-bethune"),
+    ]
+    lots: list[AuctionLot] = []
+
+    for brand, url in pages:
+        resp = fetch(url, session)
+        if not resp:
+            continue
+
+        raw = _phillips_extract_upcoming(resp.text)
+        log.info("Phillips %s: %d upcoming lot(s)", brand, len(raw))
+
+        for lot in raw:
+            if lot.get("isSaleOver", True):
+                continue
+
+            maker   = lot.get("makerName", "")
+            model   = lot.get("wModelName", "")
+            title   = f"{maker} {model}".strip()
+
+            low     = lot.get("lowEstimate", 0)
+            high    = lot.get("highEstimate", 0)
+            sign    = lot.get("currencySign", "$")
+            estimate = (
+                f"{sign}{int(low):,} – {sign}{int(high):,}"
+                if low and high else "—"
+            )
+
+            sale_num  = lot.get("saleNumber", "")
+            location  = _phillips_sale_location(sale_num)
+            iso_date  = lot.get("auctionStartDateTimeOffset", "")
+            sale_date = _phillips_parse_date(iso_date) if iso_date else "—"
+
+            detail   = lot.get("detailLink", "")
+            lot_url  = detail if detail.startswith("http") else BASE + detail
+
+            img_path = lot.get("imagePath", "")
+            if img_path.startswith("//"):
+                img_url = "https:" + img_path
+            elif img_path.startswith("/"):
+                img_url = BASE + img_path
+            else:
+                img_url = img_path
+
+            lots.append(AuctionLot(
+                title=title, estimate=estimate,
+                sale_date=sale_date, sale_location=location,
+                image_url=img_url, lot_url=lot_url, brand=brand,
+            ))
+
+        time.sleep(1)
+
+    return lots
+
+
 # ── Deduplication ──────────────────────────────────────────────────────────────
 def deduplicate(listings: list[Listing]) -> list[Listing]:
     seen: set[str] = set()
@@ -820,13 +965,17 @@ SCRAPERS = [
 ]
 
 
-def gather_all(only_source: Optional[str] = None) -> tuple[list[Listing], list[dict]]:
+def gather_all(
+    only_source: Optional[str] = None,
+) -> tuple[list[Listing], list[AuctionLot], list[dict]]:
     """
     Run all scrapers (or just one if only_source is given).
     only_source is matched case-insensitively as a substring, e.g. "chrono" matches "Chrono24".
+    Returns (listings, auction_lots, stats).
     """
     session = make_session()
     all_listings: list[Listing] = []
+    auction_lots: list[AuctionLot] = []
     stats: list[dict] = []
 
     for name, scraper_fn in SCRAPERS:
@@ -843,10 +992,24 @@ def gather_all(only_source: Optional[str] = None) -> tuple[list[Listing], list[d
             log.error("Scraper %s crashed: %s", name, exc)
             stats.append({"source": name, "count": 0, "error": str(exc)})
 
-    return all_listings, stats
+    # Phillips runs separately — returns AuctionLot, not Listing
+    if not only_source or "phillips" in (only_source or "").lower():
+        log.info("── Scraping Phillips …")
+        try:
+            lots = scrape_phillips(session)
+            auction_lots.extend(lots)
+            stats.append({"source": "Phillips (upcoming)", "count": len(lots), "error": None})
+            log.info("   → %d upcoming lot(s)", len(lots))
+        except Exception as exc:
+            log.error("Phillips scraper crashed: %s", exc)
+            stats.append({"source": "Phillips (upcoming)", "count": 0, "error": str(exc)})
+
+    return all_listings, auction_lots, stats
 
 
-def print_console_summary(listings: list[Listing], stats: list[dict]) -> None:
+def print_console_summary(
+    listings: list[Listing], auction_lots: list[AuctionLot], stats: list[dict]
+) -> None:
     """Print a readable summary table to stdout — always shown in dev mode."""
     fpj = [l for l in listings if l.brand == "FP Journe"]
     db  = [l for l in listings if l.brand == "De Bethune"]
@@ -862,18 +1025,23 @@ def print_console_summary(listings: list[Listing], stats: list[dict]) -> None:
         print(f"\n  {brand_name} ({len(brand_listings)})")
         print("  " + "─" * (w - 2))
         for l in brand_listings:
-            # Truncate title to fit terminal width
             title = l.title if len(l.title) <= 44 else l.title[:41] + "…"
-            price = l.price.ljust(12)
-            source = l.source[:18]
-            print(f"  {title:<44}  {price}  {source}")
+            print(f"  {title:<44}  {l.price.ljust(12)}  {l.source[:18]}")
+        print()
+
+    if auction_lots:
+        print(f"  Phillips Upcoming ({len(auction_lots)} lot(s))")
+        print("  " + "─" * (w - 2))
+        for lot in auction_lots:
+            title = lot.title if len(lot.title) <= 44 else lot.title[:41] + "…"
+            print(f"  {title:<44}  {lot.estimate[:12].ljust(12)}  {lot.sale_date}")
         print()
 
     print("  Source breakdown:")
     for s in stats:
         status = f"{s['count']} listings" if s["count"] > 0 else "0 listings"
         err    = f"  ⚠ {s['error']}" if s["error"] else ""
-        print(f"    {s['source']:<26}  {status}{err}")
+        print(f"    {s['source']:<28}  {status}{err}")
     print("━" * w + "\n")
 
 
@@ -930,6 +1098,61 @@ def listing_table_html(brand_listings: list[Listing]) -> str:
     )
 
 
+def auction_table_html(lots: list[AuctionLot]) -> str:
+    if not lots:
+        return "<p style='color:#999;font-style:italic;margin:8px 0;'>No upcoming lots found.</p>"
+    rows = []
+    for lot in lots:
+        img_cell = (
+            f'<a href="{escape(lot.lot_url)}">'
+            f'<img src="{escape(lot.image_url)}" width="80" height="80" '
+            f'style="object-fit:cover;border-radius:4px;display:block;border:0;" '
+            f'onerror="this.parentElement.innerHTML=\'&nbsp;\'" /></a>'
+            if lot.image_url else "&nbsp;"
+        )
+        rows.append(
+            f'<tr style="border-bottom:1px solid #e8e4f0;">'
+            f'<td style="padding:10px 8px;width:96px;vertical-align:middle;">{img_cell}</td>'
+            f'<td style="padding:10px 8px;vertical-align:middle;">'
+            f'  <a href="{escape(lot.lot_url)}" '
+            f'     style="color:#3a1a55;font-weight:600;text-decoration:none;font-size:14px;">'
+            f'     {escape(lot.title)}</a>'
+            f'</td>'
+            f'<td style="padding:10px 8px;vertical-align:middle;white-space:nowrap;'
+            f'font-weight:700;color:#5a3a80;font-size:14px;">{escape(lot.estimate)}</td>'
+            f'<td style="padding:10px 8px;vertical-align:middle;font-size:12px;color:#777;">'
+            f'  {escape(lot.sale_date)}<br>'
+            f'  <span style="color:#aaa;">{escape(lot.sale_location)}</span>'
+            f'</td>'
+            f'</tr>'
+        )
+    return (
+        '<table width="100%" cellpadding="0" cellspacing="0" '
+        'style="border-collapse:collapse;font-size:14px;'
+        'border:1px solid #d8d0e8;border-radius:6px;overflow:hidden;">'
+        '<thead><tr style="background:#f5f2fa;">'
+        '<th style="padding:9px 8px;text-align:left;font-size:11px;color:#999;'
+        'font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Photo</th>'
+        '<th style="padding:9px 8px;text-align:left;font-size:11px;color:#999;'
+        'font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Lot</th>'
+        '<th style="padding:9px 8px;text-align:left;font-size:11px;color:#999;'
+        'font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Estimate</th>'
+        '<th style="padding:9px 8px;text-align:left;font-size:11px;color:#999;'
+        'font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Sale Date</th>'
+        '</tr></thead>'
+        '<tbody>' + "".join(rows) + "</tbody></table>"
+    )
+
+
+# Sites we've evaluated but can't scrape — shown as a note in the email
+NOT_SCRAPED = [
+    ("Avi & Co",          "Magento platform, blocks automated access"),
+    ("Jaztime",           "403 blocked"),
+    ("Essential Watches", "Custom platform, no product API"),
+    ("Luxury Souq",       "No product API"),
+]
+
+
 def stats_table_html(stats: list[dict]) -> str:
     rows = []
     for s in stats:
@@ -957,16 +1180,21 @@ def stats_table_html(stats: list[dict]) -> str:
 
 
 def build_email(
-    listings: list[Listing], stats: list[dict]
+    listings: list[Listing],
+    auction_lots: list[AuctionLot],
+    stats: list[dict],
 ) -> tuple[str, str, str]:
     today = date.today().strftime("%B %d, %Y")
     fpj = [l for l in listings if l.brand == "FP Journe"]
     db  = [l for l in listings if l.brand == "De Bethune"]
     total = len(listings)
+    total_lots = len(auction_lots)
 
     subject = (
         f"Watch Listings — {today} "
-        f"({len(fpj)} FPJ · {len(db)} DB)"
+        f"({len(fpj)} FPJ · {len(db)} DB"
+        + (f" · {total_lots} auction lot{'s' if total_lots != 1 else ''}" if total_lots else "")
+        + ")"
     )
 
     # ── Plain text ──────────────────────────────────────────────────────────
@@ -977,6 +1205,12 @@ def build_email(
             lines.append(f"  {l.title}")
             lines.append(f"  {l.price} | {l.source}")
             lines.append(f"  {l.listing_url}\n")
+    if auction_lots:
+        lines.append(f"── Phillips Upcoming Lots ({total_lots}) ──")
+        for lot in auction_lots:
+            lines.append(f"  {lot.title}")
+            lines.append(f"  Est. {lot.estimate} | {lot.sale_date} · {lot.sale_location}")
+            lines.append(f"  {lot.lot_url}\n")
     plain = "\n".join(lines)
 
     # ── HTML ────────────────────────────────────────────────────────────────
@@ -992,6 +1226,45 @@ def build_email(
             f'{count_str}</span></h3>'
             + listing_table_html(brand_listings)
         )
+
+    def auction_section() -> str:
+        if not auction_lots:
+            return ""
+        fpj_lots = [l for l in auction_lots if l.brand == "FP Journe"]
+        db_lots  = [l for l in auction_lots if l.brand == "De Bethune"]
+        inner = ""
+        for brand_name, lots in [("F.P. Journe", fpj_lots), ("De Bethune", db_lots)]:
+            if not lots:
+                continue
+            inner += (
+                f'<h4 style="margin:16px 0 8px;color:#3a1a55;font-size:15px;">'
+                f'{escape(brand_name)} '
+                f'<span style="font-weight:normal;color:#aaa;font-size:12px;">'
+                f'{len(lots)} lot{"s" if len(lots) != 1 else ""}</span></h4>'
+                + auction_table_html(lots)
+            )
+        return (
+            f'<div style="margin-top:40px;">'
+            f'<h3 style="margin:0 0 10px;color:#3a1a55;font-size:18px;'
+            f'border-bottom:2px solid #d8d0e8;padding-bottom:6px;">'
+            f'Upcoming at Auction — Phillips '
+            f'<span style="font-size:13px;font-weight:normal;color:#aaa;">'
+            f'{total_lots} lot{"s" if total_lots != 1 else ""}</span></h3>'
+            f'{inner}</div>'
+        )
+
+    not_scraped_note = (
+        '<div style="margin-top:16px;padding:11px 14px;background:#fafafa;'
+        'border:1px solid #ececec;border-radius:4px;">'
+        '<p style="font-size:11px;color:#bbb;margin:0 0 5px;font-weight:700;'
+        'text-transform:uppercase;letter-spacing:.6px;">Monitored manually — not scraped</p>'
+        '<p style="font-size:12px;color:#ccc;margin:0;line-height:1.8;">'
+        + " &nbsp;&middot;&nbsp; ".join(
+            f'<strong style="color:#bbb;">{escape(name)}</strong> — {escape(reason)}'
+            for name, reason in NOT_SCRAPED
+        )
+        + "</p></div>"
+    )
 
     html = f"""<!DOCTYPE html>
 <html>
@@ -1013,11 +1286,13 @@ def build_email(
 
   {brand_section("F.P. Journe", fpj)}
   {brand_section("De Bethune", db)}
+  {auction_section()}
 
   <!-- Source stats -->
   <div style="margin-top:40px;border-top:1px solid #e8e8e8;padding-top:16px;">
     <p style="font-size:12px;color:#bbb;margin:0 0 8px;">Source breakdown</p>
     {stats_table_html(stats)}
+    {not_scraped_note}
   </div>
 
 </body>
@@ -1026,8 +1301,10 @@ def build_email(
     return subject, plain, html
 
 
-def send_email(listings: list[Listing], stats: list[dict]) -> None:
-    subject, plain, html = build_email(listings, stats)
+def send_email(
+    listings: list[Listing], auction_lots: list[AuctionLot], stats: list[dict]
+) -> None:
+    subject, plain, html = build_email(listings, auction_lots, stats)
     resend.Emails.send({
         "from": RESEND_FROM,
         "to": RECIPIENT,
@@ -1035,7 +1312,8 @@ def send_email(listings: list[Listing], stats: list[dict]) -> None:
         "html": html,
         "text": plain,
     })
-    log.info("Email sent → %s | %d listing(s)", RECIPIENT, len(listings))
+    log.info("Email sent → %s | %d listing(s), %d auction lot(s)",
+             RECIPIENT, len(listings), len(auction_lots))
 
 
 # ── Entry Point ────────────────────────────────────────────────────────────────
@@ -1106,25 +1384,24 @@ if __name__ == "__main__":
     log.info("Watch Listing Monitor starting%s…",
              f" [source={args.source}]" if args.source else "")
 
-    listings, stats = gather_all(only_source=args.source)
+    listings, auction_lots, stats = gather_all(only_source=args.source)
 
     fpj_count = sum(1 for l in listings if l.brand == "FP Journe")
     db_count  = sum(1 for l in listings if l.brand == "De Bethune")
-    log.info("Total: %d listings (%d FPJ, %d DB)", len(listings), fpj_count, db_count)
+    log.info("Total: %d listings (%d FPJ, %d DB) + %d Phillips lot(s)",
+             len(listings), fpj_count, db_count, len(auction_lots))
 
-    # Always print console summary when not doing a plain production run
     if skip_email:
-        print_console_summary(listings, stats)
+        print_console_summary(listings, auction_lots, stats)
 
     if args.preview:
-        _, _, html = build_email(listings, stats)
+        _, _, html = build_email(listings, auction_lots, stats)
         out_path = pathlib.Path(args.out).resolve()
         out_path.write_text(html, encoding="utf-8")
         log.info("Preview written → %s", out_path)
-        # Open in default browser (cross-platform)
         webbrowser.open(out_path.as_uri())
         log.info("Opened in browser.")
     elif not skip_email:
-        send_email(listings, stats)
+        send_email(listings, auction_lots, stats)
 
     log.info("Done.")
