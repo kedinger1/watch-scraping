@@ -12,6 +12,7 @@ Environment variables required:
 """
 
 import argparse
+import base64
 import logging
 import os
 import pathlib
@@ -25,6 +26,7 @@ from html import escape
 from typing import Optional
 from urllib.parse import quote_plus
 
+import chrono24 as c24
 import requests
 import resend
 from bs4 import BeautifulSoup
@@ -121,118 +123,138 @@ def best_img(tag) -> str:
 # ── Chrono24 ───────────────────────────────────────────────────────────────────
 def scrape_chrono24(session: requests.Session) -> list[Listing]:
     """
-    Chrono24 dedicated brand listing pages, paginated.
-    Pre-owned only (watchTypes=U).
+    Uses the `chrono24` Python library which correctly handles Chrono24's
+    session/anti-bot layer and returns structured JSON — no HTML parsing.
+    120 listings per page; we fetch up to MAX_PAGES pages per brand.
     """
     listings: list[Listing] = []
-    brands = [
-        ("FP Journe",  "fp-journe"),
-        ("De Bethune", "de-bethune"),
+    queries = [
+        ("FP Journe",  "F.P. Journe"),
+        ("De Bethune", "De Bethune"),
     ]
-    for brand, slug in brands:
-        for page in range(1, MAX_PAGES + 1):
-            url = (
-                f"https://www.chrono24.com/{slug}/index.htm"
-                f"?watchTypes=U&showpage={page}"
-            )
-            resp = fetch(url, session)
-            if not resp:
-                break
-            soup = BeautifulSoup(resp.text, "lxml")
-
-            # Chrono24 wraps each listing in a div with class containing "article-item"
-            cards = soup.select(
-                "div.article-item-container, "
-                "div.wt-articleteaser, "
-                "div[class*='article-item']"
-            )
-            if not cards:
-                # Fallback: any <article> tag
-                cards = soup.select("article")
-
-            log.info("Chrono24 %s page %d: %d cards", brand, page, len(cards))
-            if not cards:
-                break
-
-            for card in cards:
-                a = card.find("a", href=True)
-                if not a:
-                    continue
-                href = abs_url(a["href"], "https://www.chrono24.com")
-
-                title_el = card.select_one(
-                    ".article-title, .wt-articleteaser__title, "
-                    "h2, h3, [class*='title']"
-                )
-                title = title_el.get_text(" ", strip=True) if title_el else "Unknown"
-
-                price_el = card.select_one(
-                    ".price, .article-price, .wt-articleteaser__price, "
-                    "[class*='price']"
-                )
-                price = price_el.get_text(" ", strip=True) if price_el else "—"
-
-                img_url = best_img(card.find("img"))
-
+    for brand, query in queries:
+        try:
+            results = c24.query(query).search(limit=MAX_PAGES * 120)
+            log.info("Chrono24 %s: %d listings", brand, len(results))
+            for r in results:
+                img_url = ""
+                imgs = r.get("image_urls") or []
+                if imgs:
+                    img_url = imgs[0]
+                raw_url = r.get("url", "")
+                full_url = abs_url(raw_url, "https://www.chrono24.com")
                 listings.append(Listing(
-                    title=title, price=price, image_url=img_url,
-                    listing_url=href, source="Chrono24", brand=brand,
+                    title=r.get("title", "Unknown"),
+                    price=r.get("price", "—"),
+                    image_url=img_url,
+                    listing_url=full_url,
+                    source="Chrono24",
+                    brand=brand,
                 ))
-            time.sleep(1.5)
+        except Exception as exc:
+            log.error("Chrono24 %s failed: %s", brand, exc)
+        time.sleep(2)
 
     return deduplicate(listings)
 
 
 # ── eBay ───────────────────────────────────────────────────────────────────────
+def _ebay_app_token() -> Optional[str]:
+    """
+    Fetches an OAuth 2.0 application-level access token from eBay.
+    Requires EBAY_CLIENT_ID and EBAY_CLIENT_SECRET env vars.
+    Returns None (and logs a warning) if credentials are absent.
+    """
+    client_id     = os.environ.get("EBAY_CLIENT_ID", "")
+    client_secret = os.environ.get("EBAY_CLIENT_SECRET", "")
+    if not client_id or not client_secret:
+        log.warning("EBAY_CLIENT_ID / EBAY_CLIENT_SECRET not set — skipping eBay")
+        return None
+    creds   = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+    scope   = "https://api.ebay.com/oauth/api_scope"
+    try:
+        resp = requests.post(
+            "https://api.ebay.com/identity/v1/oauth2/token",
+            headers={
+                "Content-Type":  "application/x-www-form-urlencoded",
+                "Authorization": f"Basic {creds}",
+            },
+            data=f"grant_type=client_credentials&scope={quote_plus(scope)}",
+            timeout=REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        return resp.json()["access_token"]
+    except Exception as exc:
+        log.error("eBay token fetch failed: %s", exc)
+        return None
+
+
 def scrape_ebay(session: requests.Session) -> list[Listing]:
     """
-    eBay wristwatch category, pre-owned, keyword search per brand.
+    eBay Browse API — official JSON endpoint, no HTML parsing, no bot blocks.
+    Returns up to 200 listings per brand query (eBay's max per request).
+    Requires free eBay developer account: https://developer.ebay.com
     """
+    token = _ebay_app_token()
+    if not token:
+        return []
+
     listings: list[Listing] = []
+    api_headers = {
+        "Authorization":           f"Bearer {token}",
+        "X-EBAY-C-MARKETPLACE-ID": "EBAY_US",
+        "Content-Type":            "application/json",
+    }
     queries = [
         ("FP Journe",  "F.P. Journe watch"),
         ("De Bethune", "De Bethune watch"),
     ]
     for brand, query in queries:
-        for page in range(1, MAX_PAGES + 1):
-            url = (
-                "https://www.ebay.com/sch/i.html"
-                f"?_nkw={quote_plus(query)}"
-                "&_sacat=31387"       # Wristwatches
-                "&LH_ItemCondition=3000"  # Used / pre-owned
-                f"&_pgn={page}"
-            )
-            resp = fetch(url, session)
-            if not resp:
+        offset = 0
+        while offset < MAX_PAGES * 50:
+            try:
+                resp = requests.get(
+                    "https://api.ebay.com/buy/browse/v1/item_summary/search",
+                    headers=api_headers,
+                    params={
+                        "q":            query,
+                        "category_ids": "31387",   # Wristwatches
+                        "limit":        "50",
+                        "offset":       str(offset),
+                    },
+                    timeout=REQUEST_TIMEOUT,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as exc:
+                log.error("eBay Browse API error (%s offset=%d): %s", brand, offset, exc)
                 break
-            soup = BeautifulSoup(resp.text, "lxml")
-            items = soup.select("li.s-item")
-            log.info("eBay %s page %d: %d items", brand, page, len(items))
+
+            items = data.get("itemSummaries", [])
+            log.info("eBay %s offset=%d: %d items", brand, offset, len(items))
             if not items:
                 break
 
             for item in items:
-                a = item.select_one("a.s-item__link")
-                if not a:
-                    continue
-                href = a["href"]
-
-                title_el = item.select_one(".s-item__title")
-                title = title_el.get_text(" ", strip=True) if title_el else "Unknown"
-                # eBay sometimes inserts a ghost "Shop on eBay" item
-                if title.lower().startswith("shop on ebay"):
-                    continue
-
-                price_el = item.select_one(".s-item__price")
-                price = price_el.get_text(" ", strip=True) if price_el else "—"
-
-                img_url = best_img(item.find("img"))
+                price_val = item.get("price", {})
+                try:
+                    price = f"${float(price_val.get('value', 0)):,.0f}"
+                except (ValueError, TypeError):
+                    price = price_val.get("value", "—")
 
                 listings.append(Listing(
-                    title=title, price=price, image_url=img_url,
-                    listing_url=href, source="eBay", brand=brand,
+                    title=item.get("title", "Unknown"),
+                    price=price,
+                    image_url=item.get("image", {}).get("imageUrl", ""),
+                    listing_url=item.get("itemWebUrl", ""),
+                    source="eBay",
+                    brand=brand,
                 ))
-            time.sleep(1.5)
+
+            offset += 50
+            if offset >= data.get("total", 0):
+                break
+            time.sleep(0.5)
 
     return deduplicate(listings)
 
@@ -414,40 +436,96 @@ def scrape_european_watch_co(session: requests.Session) -> list[Listing]:
 # ── Bezel ──────────────────────────────────────────────────────────────────────
 def scrape_bezel(session: requests.Session) -> list[Listing]:
     """
-    Bezel (getbezel.com) — mobile-first marketplace with a web search view.
-    Note: if the site uses client-side rendering, cards may be 0 here.
+    Bezel (shop.getbezel.com) is a fully JS-rendered React/Plasmic app —
+    requests+BS4 returns an empty shell. We use Playwright (headless Chromium)
+    to execute the JavaScript and pull the rendered listing cards.
+
+    Brand listing pages:
+      https://shop.getbezel.com/explore/fp-journe
+      https://shop.getbezel.com/explore/de-bethune
+    Individual listing URLs follow: /watches/{brand}/{model}/ref-{ref}/id-{id}
     """
-    listings: list[Listing] = []
-    BASE = "https://getbezel.com"
-    queries = [
-        ("FP Journe",  f"{BASE}/search?q=fp+journe"),
-        ("De Bethune", f"{BASE}/search?q=de+bethune"),
-    ]
-    for brand, url in queries:
-        resp = fetch(url, session)
-        if not resp:
-            continue
-        soup = BeautifulSoup(resp.text, "lxml")
-        cards = soup.select(
-            "[class*='listing'], [class*='watch-card'], "
-            "[class*='product-card'], article"
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
+    except ImportError:
+        log.warning(
+            "Playwright not installed — skipping Bezel. "
+            "Run: pip install playwright && playwright install chromium"
         )
-        log.info("Bezel %s: %d cards", brand, len(cards))
-        for card in cards:
-            a = card.find("a", href=True)
-            if not a:
-                continue
-            href = abs_url(a["href"], BASE)
-            title_el = card.select_one("h2, h3, [class*='title'], [class*='name']")
-            title = title_el.get_text(" ", strip=True) if title_el else "Unknown"
-            price_el = card.select_one("[class*='price']")
-            price = price_el.get_text(" ", strip=True) if price_el else "—"
-            img_url = best_img(card.find("img"))
-            listings.append(Listing(
-                title=title, price=price, image_url=img_url,
-                listing_url=href, source="Bezel", brand=brand,
-            ))
-        time.sleep(1)
+        return []
+
+    listings: list[Listing] = []
+    pages_to_visit = [
+        ("FP Journe",  "https://shop.getbezel.com/explore/fp-journe"),
+        ("De Bethune", "https://shop.getbezel.com/explore/de-bethune"),
+    ]
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        ctx = browser.new_context(user_agent=HEADERS["User-Agent"])
+        page = ctx.new_page()
+
+        for brand, url in pages_to_visit:
+            try:
+                page.goto(url, wait_until="networkidle", timeout=45_000)
+                # Wait until at least one watch link renders
+                page.wait_for_selector('a[href*="/watches/"]', timeout=20_000)
+
+                # Extract every listing card via JS — avoids fragile class-name selectors
+                items = page.evaluate("""() => {
+                    const seen = new Set();
+                    const results = [];
+                    document.querySelectorAll('a[href*="/watches/"]').forEach(a => {
+                        const href = a.href;
+                        if (seen.has(href)) return;
+                        seen.add(href);
+                        // Walk up to find a card-like container
+                        const card = a.closest('li, article, section, [class*="card"], [class*="item"], [class*="tile"]') || a;
+                        const img = card.querySelector('img');
+                        // Collect all leaf-node text snippets
+                        const texts = [];
+                        card.querySelectorAll('*').forEach(el => {
+                            if (el.children.length === 0) {
+                                const t = el.textContent.trim();
+                                if (t) texts.push(t);
+                            }
+                        });
+                        results.push({
+                            url:      href,
+                            imageUrl: img ? (img.src || img.dataset.src || img.dataset.lazySrc || '') : '',
+                            texts:    texts,
+                        });
+                    });
+                    return results;
+                }""")
+
+                log.info("Bezel %s: %d listings", brand, len(items))
+
+                for item in items:
+                    texts = item.get("texts", [])
+                    # First non-trivial text is usually the title
+                    title = next((t for t in texts if len(t) > 6), "Unknown")
+                    # Price: contains $ and at least one digit
+                    price = next(
+                        (t for t in texts if "$" in t and any(c.isdigit() for c in t)),
+                        "—"
+                    )
+                    listings.append(Listing(
+                        title=title,
+                        price=price,
+                        image_url=item.get("imageUrl", ""),
+                        listing_url=item.get("url", ""),
+                        source="Bezel",
+                        brand=brand,
+                    ))
+
+            except PwTimeout:
+                log.warning("Bezel timed out for %s — page may not have loaded", brand)
+            except Exception as exc:
+                log.warning("Bezel error for %s: %s", brand, exc)
+
+        browser.close()
+
     return deduplicate(listings)
 
 
