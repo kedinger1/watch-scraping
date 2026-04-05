@@ -101,7 +101,11 @@ For GitHub Actions, add all five as **repository secrets** under
 
 ### 3. Schedule
 
-The workflow runs automatically every day at **7:30 AM EST** (12:30 UTC).
+The workflow runs automatically every day at **7:30 AM Eastern**.
+
+> GitHub Actions cron runs in UTC and has no DST awareness. The cron needs a manual update twice a year to hold clock time:
+> - **Mid-March (clocks spring forward to EDT, UTC−4):** set cron to `30 11 * * *`
+> - **Early November (clocks fall back to EST, UTC−5):** set cron to `30 12 * * *`
 You can also trigger it manually via the **"Run workflow"** button in the Actions tab.
 
 ---

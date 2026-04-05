@@ -2,7 +2,7 @@ name: Watch Listing Monitor
 
 on:
   schedule:
-    - cron: "30 12 * * *"  # 7:30 AM EST (UTC-5) every day
+    - cron: "30 11 * * *"  # 7:30 AM EDT (UTC-4) — change to "30 12 * * *" in early November when clocks fall back
   workflow_dispatch:        # "Run workflow" button in GitHub Actions UI
 
 jobs:
