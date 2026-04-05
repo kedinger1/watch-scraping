@@ -13,9 +13,11 @@ Environment variables required:
 
 import argparse
 import base64
+import json
 import logging
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import time
@@ -408,35 +410,204 @@ def scrape_watchbox(session: requests.Session) -> list[Listing]:
 
 
 # ── European Watch Company ─────────────────────────────────────────────────────
+def _ewc_parse_next_json(html: str) -> list[dict]:
+    """
+    EWC runs on Next.js RSC (React Server Components). Watch data is serialised
+    as JSON objects inside self.__next_f.push() script tags, with internal
+    double-quotes escaped as \".  We un-escape, locate every object that
+    contains a 'stock_number' key, and return the parsed dicts.
+    """
+    # Un-escape the JS string layer so we can use json.loads reliably
+    text = html.replace('\\"', '"').replace("\\'", "'").replace('\\\\', '\\')
+
+    results: list[dict] = []
+    seen: set[int] = set()
+
+    for m in re.finditer(r'"stock_number"\s*:\s*(\d+)', text):
+        stock_num = int(m.group(1))
+        if stock_num in seen:
+            continue
+
+        # Walk backwards from the match to find the opening '{'
+        start = m.start()
+        while start > 0 and text[start] != '{':
+            start -= 1
+        if text[start] != '{':
+            continue
+
+        # Match braces forward (ignoring chars inside strings)
+        depth, in_str, esc, end = 0, False, False, start
+        for i in range(start, min(start + 20_000, len(text))):
+            c = text[i]
+            if esc:
+                esc = False
+                continue
+            if c == '\\' and in_str:
+                esc = True
+                continue
+            if c == '"':
+                in_str = not in_str
+            elif not in_str:
+                if c == '{':
+                    depth += 1
+                elif c == '}':
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+
+        try:
+            obj = json.loads(text[start:end])
+        except json.JSONDecodeError:
+            continue
+
+        if isinstance(obj, dict) and "web_price" in obj:
+            seen.add(stock_num)
+            results.append(obj)
+
+    return results
+
+
+# Statuses EWC uses for unavailable inventory
+_EWC_SKIP_STATUSES = {"SOLD", "ARCHIVED", "DELETED", "HOLD"}
+
+
 def scrape_european_watch_co(session: requests.Session) -> list[Listing]:
-    listings: list[Listing] = []
+    """
+    EWC embeds structured JSON in Next.js RSC script tags — no Playwright needed.
+    Uses brand page for FP Journe and the search endpoint for De Bethune.
+    Skips sold / archived / on-hold pieces.
+    """
     BASE = "https://www.europeanwatch.com"
-    queries = [
-        ("FP Journe",  f"{BASE}/search?q=fp+journe"),
-        ("De Bethune", f"{BASE}/search?q=de+bethune"),
+    urls = [
+        ("FP Journe",  f"{BASE}/brand/f-p-journe"),
+        ("De Bethune", f"{BASE}/search?search=de%20bethune"),
     ]
-    for brand, url in queries:
+    listings: list[Listing] = []
+
+    for brand, url in urls:
         resp = fetch(url, session)
         if not resp:
             continue
-        soup = BeautifulSoup(resp.text, "lxml")
-        cards = soup.select(".product-item, .grid-item, [class*='product']")
-        log.info("European Watch Co %s: %d cards", brand, len(cards))
-        for card in cards:
-            a = card.find("a", href=True)
-            if not a:
+
+        raw = _ewc_parse_next_json(resp.text)
+        log.info("European Watch Co %s: %d raw items", brand, len(raw))
+
+        for item in raw:
+            status = (item.get("status") or "").upper()
+            if status in _EWC_SKIP_STATUSES:
                 continue
-            href = abs_url(a["href"], BASE)
-            title_el = card.select_one("h2, h3, [class*='title'], [class*='name']")
-            title = title_el.get_text(" ", strip=True) if title_el else "Unknown"
-            price_el = card.select_one("[class*='price'], .money")
-            price = price_el.get_text(" ", strip=True) if price_el else "—"
-            img_url = best_img(card.find("img"))
+
+            title = f"{item.get('brand', '')} {item.get('model', '')}".strip()
+            detected = detect_brand(title)
+            if not detected:
+                continue
+
+            price_num = item.get("web_price") or 0
+            price = f"${price_num:,.0f}" if price_num else "—"
+
+            images = item.get("images") or []
+            img_url = images[0] if images else ""
+
+            slug = item.get("slug", "")
+            listing_url = f"{BASE}/watch/{slug}" if slug else BASE
+
             listings.append(Listing(
                 title=title, price=price, image_url=img_url,
-                listing_url=href, source="European Watch Co.", brand=brand,
+                listing_url=listing_url, source="European Watch Co.", brand=detected,
             ))
+
         time.sleep(1)
+
+    return deduplicate(listings)
+
+
+# ── WristCheck ─────────────────────────────────────────────────────────────────
+def scrape_wristcheck(session: requests.Session) -> list[Listing]:
+    """
+    WristCheck (wristcheck.com) is a JS-rendered React app — Playwright required.
+    Brand pages:
+      https://wristcheck.com/us/buy/f-p-journe
+      https://wristcheck.com/us/buy/de-bethune
+    Individual listings: /us/buy/{brand}/{model-slug}
+    """
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
+    except ImportError:
+        log.warning("Playwright not installed — skipping WristCheck.")
+        return []
+
+    listings: list[Listing] = []
+    pages_to_visit = [
+        ("FP Journe",  "https://wristcheck.com/us/buy/f-p-journe"),
+        ("De Bethune", "https://wristcheck.com/us/buy/de-bethune"),
+    ]
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        ctx = browser.new_context(user_agent=HEADERS["User-Agent"])
+        page = ctx.new_page()
+
+        for brand, url in pages_to_visit:
+            try:
+                page.goto(url, wait_until="networkidle", timeout=45_000)
+                # WristCheck listing cards link to /us/buy/{brand}/{model}
+                page.wait_for_selector('a[href*="/us/buy/"]', timeout=20_000)
+
+                items = page.evaluate("""() => {
+                    const seen = new Set();
+                    const results = [];
+                    // Listing links go deeper than the brand root (/us/buy/brand/model)
+                    document.querySelectorAll('a[href*="/us/buy/"]').forEach(a => {
+                        const href = a.href;
+                        // Skip the brand root page links (only want model-level pages)
+                        const parts = href.split('/us/buy/')[1] || '';
+                        if (!parts.includes('/')) return;
+                        if (seen.has(href)) return;
+                        seen.add(href);
+                        const card = a.closest('li, article, [class*="card"], [class*="item"], [class*="listing"]') || a;
+                        const img = card.querySelector('img');
+                        const texts = [];
+                        card.querySelectorAll('*').forEach(el => {
+                            if (el.children.length === 0) {
+                                const t = el.textContent.trim();
+                                if (t) texts.push(t);
+                            }
+                        });
+                        results.push({
+                            url:      href,
+                            imageUrl: img ? (img.src || img.dataset.src || '') : '',
+                            texts:    texts,
+                        });
+                    });
+                    return results;
+                }""")
+
+                log.info("WristCheck %s: %d listings", brand, len(items))
+
+                for item in items:
+                    texts = item.get("texts", [])
+                    title = next((t for t in texts if len(t) > 6), "Unknown")
+                    price = next(
+                        (t for t in texts if "$" in t and any(c.isdigit() for c in t)),
+                        "—"
+                    )
+                    listings.append(Listing(
+                        title=title,
+                        price=price,
+                        image_url=item.get("imageUrl", ""),
+                        listing_url=item.get("url", ""),
+                        source="WristCheck",
+                        brand=brand,
+                    ))
+
+            except PwTimeout:
+                log.warning("WristCheck timed out for %s", brand)
+            except Exception as exc:
+                log.warning("WristCheck error for %s: %s", brand, exc)
+
+        browser.close()
+
     return deduplicate(listings)
 
 
@@ -627,12 +798,19 @@ SCRAPERS = [
     ("A Collected Man",        lambda s: scrape_shopify_store(
         s, "https://www.acollectedman.com", "A Collected Man"
     )),
+    ("Wrist Aficionado",       lambda s: scrape_shopify_store(
+        s, "https://wristaficionado.com", "Wrist Aficionado"
+    )),
+    ("G&G Timepieces",         lambda s: scrape_shopify_store(
+        s, "https://gandgtimepieces.com", "G&G Timepieces"
+    )),
     ("Hodinkee Shop",          lambda s: scrape_shopify_store(
         s, "https://shop.hodinkee.com", "Hodinkee Shop"
     )),
     ("WatchFinder",            scrape_watchfinder),
     ("WatchBox",               scrape_watchbox),
     ("European Watch Co.",     scrape_european_watch_co),
+    ("WristCheck",             scrape_wristcheck),
     ("Bezel",                  scrape_bezel),
     ("1stDibs",                scrape_1stdibs),
     ("Watches of Switzerland", scrape_watches_of_switzerland),
