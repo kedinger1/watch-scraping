@@ -1144,15 +1144,6 @@ def auction_table_html(lots: list[AuctionLot]) -> str:
     )
 
 
-# Sites we've evaluated but can't scrape — shown as a note in the email
-NOT_SCRAPED = [
-    ("Avi & Co",          "Magento platform, blocks automated access"),
-    ("Jaztime",           "403 blocked"),
-    ("Essential Watches", "Custom platform, no product API"),
-    ("Luxury Souq",       "No product API"),
-]
-
-
 def stats_table_html(stats: list[dict]) -> str:
     rows = []
     for s in stats:
@@ -1179,120 +1170,97 @@ def stats_table_html(stats: list[dict]) -> str:
     )
 
 
+# Brand display names used in subjects and headers
+BRAND_DISPLAY = {
+    "FP Journe":  "F.P. Journe",
+    "De Bethune": "De Bethune",
+}
+
+
 def build_email(
+    brand: str,                    # "FP Journe" or "De Bethune"
     listings: list[Listing],
     auction_lots: list[AuctionLot],
     stats: list[dict],
 ) -> tuple[str, str, str]:
-    today = date.today().strftime("%B %d, %Y")
-    fpj = [l for l in listings if l.brand == "FP Journe"]
-    db  = [l for l in listings if l.brand == "De Bethune"]
-    total = len(listings)
-    total_lots = len(auction_lots)
+    """Build subject + plain + HTML for one brand's email."""
+    today        = date.today().strftime("%B %d, %Y")
+    display      = BRAND_DISPLAY.get(brand, brand)
+    b_listings   = [l for l in listings   if l.brand == brand]
+    b_lots       = [l for l in auction_lots if l.brand == brand]
+    n_list       = len(b_listings)
+    n_lots       = len(b_lots)
+    active_src   = len([s for s in stats if s["count"] > 0])
 
     subject = (
-        f"Watch Listings — {today} "
-        f"({len(fpj)} FPJ · {len(db)} DB"
-        + (f" · {total_lots} auction lot{'s' if total_lots != 1 else ''}" if total_lots else "")
+        f"{display} Listings — {today} "
+        f"({n_list} listing{'s' if n_list != 1 else ''}"
+        + (f" · {n_lots} auction lot{'s' if n_lots != 1 else ''}" if n_lots else "")
         + ")"
     )
 
-    # ── Plain text ──────────────────────────────────────────────────────────
-    lines = [f"Watch Listings Digest — {today}", f"{total} total listings\n"]
-    for brand_name, brand_listings in [("F.P. Journe", fpj), ("De Bethune", db)]:
-        lines.append(f"── {brand_name} ({len(brand_listings)}) ──")
-        for l in brand_listings:
-            lines.append(f"  {l.title}")
-            lines.append(f"  {l.price} | {l.source}")
-            lines.append(f"  {l.listing_url}\n")
-    if auction_lots:
-        lines.append(f"── Phillips Upcoming Lots ({total_lots}) ──")
-        for lot in auction_lots:
+    # ── Plain text ───────────────────────────────────────────────────────────
+    lines = [f"{display} Listings — {today}", f"{n_list} listing(s)\n"]
+    for l in b_listings:
+        lines.append(f"  {l.title}")
+        lines.append(f"  {l.price} | {l.source}")
+        lines.append(f"  {l.listing_url}\n")
+    if b_lots:
+        lines.append(f"── Phillips Upcoming ({n_lots}) ──")
+        for lot in b_lots:
             lines.append(f"  {lot.title}")
             lines.append(f"  Est. {lot.estimate} | {lot.sale_date} · {lot.sale_location}")
             lines.append(f"  {lot.lot_url}\n")
     plain = "\n".join(lines)
 
-    # ── HTML ────────────────────────────────────────────────────────────────
-    active_sources = len([s for s in stats if s["count"] > 0])
+    # ── HTML ─────────────────────────────────────────────────────────────────
+    count_str  = f"{n_list} listing{'s' if n_list != 1 else ''}"
+    lots_str   = (
+        f' &nbsp;+&nbsp; <span style="color:#3a1a55;">'
+        f'{n_lots} Phillips lot{"s" if n_lots != 1 else ""}</span>'
+        if n_lots else ""
+    )
 
-    def brand_section(name: str, brand_listings: list[Listing]) -> str:
-        count_str = f"{len(brand_listings)} listing{'s' if len(brand_listings) != 1 else ''}"
-        return (
-            f'<h3 style="margin:28px 0 10px;color:#1a3550;font-size:18px;'
-            f'border-bottom:2px solid #e0d8cc;padding-bottom:6px;">'
-            f'{escape(name)} '
-            f'<span style="font-size:13px;font-weight:normal;color:#aaa;">'
-            f'{count_str}</span></h3>'
-            + listing_table_html(brand_listings)
-        )
-
-    def auction_section() -> str:
-        if not auction_lots:
-            return ""
-        fpj_lots = [l for l in auction_lots if l.brand == "FP Journe"]
-        db_lots  = [l for l in auction_lots if l.brand == "De Bethune"]
-        inner = ""
-        for brand_name, lots in [("F.P. Journe", fpj_lots), ("De Bethune", db_lots)]:
-            if not lots:
-                continue
-            inner += (
-                f'<h4 style="margin:16px 0 8px;color:#3a1a55;font-size:15px;">'
-                f'{escape(brand_name)} '
-                f'<span style="font-weight:normal;color:#aaa;font-size:12px;">'
-                f'{len(lots)} lot{"s" if len(lots) != 1 else ""}</span></h4>'
-                + auction_table_html(lots)
-            )
-        return (
+    auction_html = ""
+    if b_lots:
+        auction_html = (
             f'<div style="margin-top:40px;">'
             f'<h3 style="margin:0 0 10px;color:#3a1a55;font-size:18px;'
             f'border-bottom:2px solid #d8d0e8;padding-bottom:6px;">'
             f'Upcoming at Auction — Phillips '
             f'<span style="font-size:13px;font-weight:normal;color:#aaa;">'
-            f'{total_lots} lot{"s" if total_lots != 1 else ""}</span></h3>'
-            f'{inner}</div>'
+            f'{n_lots} lot{"s" if n_lots != 1 else ""}</span></h3>'
+            + auction_table_html(b_lots)
+            + '</div>'
         )
-
-    not_scraped_note = (
-        '<div style="margin-top:16px;padding:11px 14px;background:#fafafa;'
-        'border:1px solid #ececec;border-radius:4px;">'
-        '<p style="font-size:11px;color:#bbb;margin:0 0 5px;font-weight:700;'
-        'text-transform:uppercase;letter-spacing:.6px;">Monitored manually — not scraped</p>'
-        '<p style="font-size:12px;color:#ccc;margin:0;line-height:1.8;">'
-        + " &nbsp;&middot;&nbsp; ".join(
-            f'<strong style="color:#bbb;">{escape(name)}</strong> — {escape(reason)}'
-            for name, reason in NOT_SCRAPED
-        )
-        + "</p></div>"
-    )
 
     html = f"""<!DOCTYPE html>
 <html>
 <body style="font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;
-             max-width:900px;margin:auto;color:#222;padding:24px;
-             background:#fff;">
+             max-width:900px;margin:auto;color:#222;padding:24px;background:#fff;">
 
-  <!-- Header -->
   <div style="border-bottom:3px solid #1a3550;padding-bottom:14px;margin-bottom:4px;">
     <h2 style="margin:0;font-size:24px;color:#1a3550;letter-spacing:-.3px;">
-      Watch Listings Digest
+      {escape(display)} Listings
     </h2>
     <p style="margin:5px 0 0;color:#999;font-size:13px;">
       {escape(today)} &mdash;
-      <strong style="color:#444;">{total}</strong> listing{'s' if total != 1 else ''}
-      across <strong style="color:#444;">{active_sources}</strong> source{'s' if active_sources != 1 else ''}
+      <strong style="color:#444;">{count_str}</strong>{lots_str}
+      across <strong style="color:#444;">{active_src}</strong> source{'s' if active_src != 1 else ''}
     </p>
   </div>
 
-  {brand_section("F.P. Journe", fpj)}
-  {brand_section("De Bethune", db)}
-  {auction_section()}
+  <h3 style="margin:24px 0 10px;color:#1a3550;font-size:18px;
+             border-bottom:2px solid #e0d8cc;padding-bottom:6px;">
+    {escape(display)}
+    <span style="font-size:13px;font-weight:normal;color:#aaa;">{count_str}</span>
+  </h3>
+  {listing_table_html(b_listings)}
+  {auction_html}
 
-  <!-- Source stats -->
   <div style="margin-top:40px;border-top:1px solid #e8e8e8;padding-top:16px;">
     <p style="font-size:12px;color:#bbb;margin:0 0 8px;">Source breakdown</p>
     {stats_table_html(stats)}
-    {not_scraped_note}
   </div>
 
 </body>
@@ -1301,19 +1269,23 @@ def build_email(
     return subject, plain, html
 
 
-def send_email(
+def send_emails(
     listings: list[Listing], auction_lots: list[AuctionLot], stats: list[dict]
 ) -> None:
-    subject, plain, html = build_email(listings, auction_lots, stats)
-    resend.Emails.send({
-        "from": RESEND_FROM,
-        "to": RECIPIENT,
-        "subject": subject,
-        "html": html,
-        "text": plain,
-    })
-    log.info("Email sent → %s | %d listing(s), %d auction lot(s)",
-             RECIPIENT, len(listings), len(auction_lots))
+    """Send one email per brand — F.P. Journe first, then De Bethune."""
+    for brand in ("FP Journe", "De Bethune"):
+        subject, plain, html = build_email(brand, listings, auction_lots, stats)
+        resend.Emails.send({
+            "from": RESEND_FROM,
+            "to":   RECIPIENT,
+            "subject": subject,
+            "html": html,
+            "text": plain,
+        })
+        b_count = sum(1 for l in listings    if l.brand == brand)
+        l_count = sum(1 for l in auction_lots if l.brand == brand)
+        log.info("Email sent [%s] → %s | %d listing(s), %d lot(s)",
+                 brand, RECIPIENT, b_count, l_count)
 
 
 # ── Entry Point ────────────────────────────────────────────────────────────────
@@ -1395,13 +1367,15 @@ if __name__ == "__main__":
         print_console_summary(listings, auction_lots, stats)
 
     if args.preview:
-        _, _, html = build_email(listings, auction_lots, stats)
-        out_path = pathlib.Path(args.out).resolve()
-        out_path.write_text(html, encoding="utf-8")
-        log.info("Preview written → %s", out_path)
-        webbrowser.open(out_path.as_uri())
-        log.info("Opened in browser.")
+        base = pathlib.Path(args.out)
+        stem, suffix = base.stem, base.suffix
+        for brand, slug in [("FP Journe", "fpj"), ("De Bethune", "db")]:
+            _, _, html = build_email(brand, listings, auction_lots, stats)
+            out_path = base.with_name(f"{stem}-{slug}{suffix}").resolve()
+            out_path.write_text(html, encoding="utf-8")
+            log.info("Preview written → %s", out_path)
+            webbrowser.open(out_path.as_uri())
     elif not skip_email:
-        send_email(listings, auction_lots, stats)
+        send_emails(listings, auction_lots, stats)
 
     log.info("Done.")
