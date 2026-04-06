@@ -181,8 +181,22 @@ def scrape_chrono24(session: requests.Session) -> list[Listing]:
                 f"?dosearch=true&query={quote_plus(query)}&sortorder=5&pageSize=120"
             )
             try:
-                page.goto(url, wait_until="networkidle", timeout=60_000)
-                page.wait_for_selector(".js-listing-item-link", timeout=30_000)
+                # domcontentloaded is reliable in CI — networkidle can hang
+                # indefinitely when the page fires continuous background requests
+                # (analytics, Algolia keep-alive). We give JS 6 s to render
+                # the listing cards, then wait explicitly for the selector.
+                page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+                page.wait_for_timeout(6_000)
+
+                try:
+                    page.wait_for_selector(".js-listing-item-link", timeout=45_000)
+                except PwTimeout:
+                    log.warning(
+                        "Chrono24 %s: listing selector not found — page title: %r",
+                        brand, page.title(),
+                    )
+                    ctx.close()
+                    continue
 
                 items = page.evaluate("""() => {
                     const seen = new Set();
