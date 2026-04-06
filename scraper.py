@@ -438,37 +438,93 @@ def scrape_shopify_store(
 
 # ── WatchFinder ────────────────────────────────────────────────────────────────
 def scrape_watchfinder(session: requests.Session) -> list[Listing]:
+    """
+    WatchFinder is a JS/Algolia-rendered SPA — BeautifulSoup returns an empty
+    shell. Instead, we call the Algolia Search API directly using credentials
+    captured from the page's network traffic (public search-only key).
+
+    Algolia app:  OKFY50YJB0
+    Index:        prod-stock-index-us-published-desc
+    URL pattern:  /{Brand}/{SeriesSlug}/{ModelSlug}/{ModelId}/item/{StockId}
+    """
+    from urllib.parse import quote as url_quote
+
+    APP_ID  = "OKFY50YJB0"
+    API_KEY = "764287a20e17e2fd10d8dc8bfb1291eb"
+    INDEX   = "prod-stock-index-us-published-desc"
+    BASE    = "https://www.watchfinder.com"
+    ALGOLIA = f"https://{APP_ID}-dsn.algolia.net/1/indexes/{INDEX}/query"
+    HEADERS = {
+        "X-Algolia-Application-Id": APP_ID,
+        "X-Algolia-API-Key":        API_KEY,
+        "Content-Type":             "application/json",
+    }
+
     listings: list[Listing] = []
-    BASE = "https://www.watchfinder.com"
     queries = [
-        ("FP Journe",  f"{BASE}/search?q=F.P.+Journe"),
-        ("De Bethune", f"{BASE}/search?q=De+Bethune"),
+        ("FP Journe",  "F.P. Journe"),
+        ("De Bethune", "De Bethune"),
     ]
-    for brand, url in queries:
-        resp = fetch(url, session)
-        if not resp:
-            continue
-        soup = BeautifulSoup(resp.text, "lxml")
-        cards = soup.select(
-            ".product-card, .watch-card, "
-            "article.product, [class*='product-item']"
-        )
-        log.info("WatchFinder %s: %d cards", brand, len(cards))
-        for card in cards:
-            a = card.find("a", href=True)
-            if not a:
-                continue
-            href = abs_url(a["href"], BASE)
-            title_el = card.select_one("h2, h3, .product-title, [class*='title']")
-            title = title_el.get_text(" ", strip=True) if title_el else "Unknown"
-            price_el = card.select_one(".price, [class*='price']")
-            price = price_el.get_text(" ", strip=True) if price_el else "—"
-            img_url = best_img(card.find("img"))
-            listings.append(Listing(
-                title=title, price=price, image_url=img_url,
-                listing_url=href, source="WatchFinder", brand=brand,
-            ))
-        time.sleep(1)
+
+    for brand, query in queries:
+        page = 0
+        while True:
+            try:
+                resp = session.post(
+                    ALGOLIA,
+                    headers=HEADERS,
+                    json={"query": query, "hitsPerPage": 100, "page": page},
+                    timeout=REQUEST_TIMEOUT,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as exc:
+                log.warning("WatchFinder Algolia error (%s page %d): %s", brand, page, exc)
+                break
+
+            hits     = data.get("hits", [])
+            nb_pages = data.get("nbPages", 1)
+            log.info("WatchFinder %s page %d: %d hits", brand, page, len(hits))
+
+            for h in hits:
+                brand_name  = h.get("Brand", "")
+                series      = h.get("Series", "")
+                series_slug = h.get("SeriesSlug", series)
+                model_slug  = h.get("ModelSlug", "")
+                model_id    = h.get("ModelId", "")
+                stock_id    = h.get("StockId", "")
+                model_num   = h.get("ModelNumber", "")
+
+                title = f"{brand_name} {series} {model_num}".strip()
+
+                price_on_app = h.get("PriceOnApplication", False)
+                sales_price  = h.get("SalesPrice", 0)
+                price = "POA" if price_on_app else (
+                    f"${sales_price:,.0f}" if sales_price else "—"
+                )
+
+                # Each path segment URL-encoded individually
+                listing_url = (
+                    f"{BASE}/{url_quote(brand_name, safe='.')}"
+                    f"/{url_quote(series_slug, safe='')}"
+                    f"/{url_quote(model_slug, safe='')}"
+                    f"/{model_id}/item/{stock_id}"
+                )
+
+                listings.append(Listing(
+                    title=title,
+                    price=price,
+                    image_url=h.get("Image", ""),
+                    listing_url=listing_url,
+                    source="WatchFinder",
+                    brand=brand,
+                ))
+
+            page += 1
+            if page >= nb_pages:
+                break
+            time.sleep(0.5)
+
     return deduplicate(listings)
 
 
