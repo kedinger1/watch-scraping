@@ -1,6 +1,6 @@
 # Watch Listing Monitor
 
-A weekly automated scraper that tracks pre-owned **F.P. Journe** and **De Bethune** listings across the major watch marketplaces and auction houses. Every Monday it sends two brand-specific email digests — one per brand — with photos, titles, prices, and direct links to every active listing found.
+A daily automated scraper that tracks pre-owned **F.P. Journe** and **De Bethune** listings across the major watch marketplaces and auction houses. Each morning it sends two brand-specific email digests — one per brand — with photos, titles, prices, and direct links to every active listing found.
 
 Built and maintained by [The 1916 Company](https://www.1916company.com).
 
@@ -8,7 +8,7 @@ Built and maintained by [The 1916 Company](https://www.1916company.com).
 
 ## What It Does
 
-- Scrapes 13 sources every Monday at 7:30 AM Eastern via GitHub Actions
+- Scrapes 13 sources every day at 7:30 AM Eastern via GitHub Actions
 - Sends two HTML email digests (one F.P. Journe, one De Bethune) with a photo grid of available listings
 - Tracks upcoming auction lots separately (Phillips) with estimates, sale dates, and locations
 - Deduplicates listings across sources so the same watch doesn't appear twice
@@ -104,11 +104,11 @@ For GitHub Actions, add all seven as **repository secrets** under
 
 ### 3. Schedule
 
-The workflow runs automatically every **Monday at 7:30 AM Eastern**.
+The workflow runs automatically every day at **7:30 AM Eastern**.
 
 > GitHub Actions cron runs in UTC and has no DST awareness. The cron needs a manual update twice a year to hold clock time:
-> - **Mid-March (clocks spring forward to EDT, UTC−4):** set cron to `30 11 * * 1`
-> - **Early November (clocks fall back to EST, UTC−5):** set cron to `30 12 * * 1`
+> - **Mid-March (clocks spring forward to EDT, UTC−4):** set cron to `30 11 * * *`
+> - **Early November (clocks fall back to EST, UTC−5):** set cron to `30 12 * * *`
 You can also trigger it manually via the **"Run workflow"** button in the Actions tab.
 
 ---
