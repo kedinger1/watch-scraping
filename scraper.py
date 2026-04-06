@@ -1075,9 +1075,11 @@ def _phillips_extract_upcoming(html: str) -> list[dict]:
     Phillips artist pages embed all lot data as a JSON string inside a React
     component prop.  The key sequence is always:
       "upcomingLots" … "data" … [  { lot objects }  ]
-    We un-escape the JS string layer, locate the array, then parse it.
+    Phillips Unicode-escapes quote characters as \\u0022 rather than \\\"
+    so we decode all \\uXXXX sequences before searching for lot data.
     """
-    text = html.replace('\\"', '"').replace('\\\\', '\\')
+    text = re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), html)
+    text = text.replace('\\"', '"').replace('\\\\', '\\')
 
     key = '"upcomingLots"'
     start = text.find(key)
