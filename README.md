@@ -1,6 +1,6 @@
 # Watch Listing Monitor
 
-A daily automated scraper that tracks pre-owned **F.P. Journe** and **De Bethune** listings across the major watch marketplaces and auction houses. Each morning it sends two brand-specific email digests — one per brand — with photos, titles, prices, and direct links to every active listing found.
+A weekly automated scraper that tracks pre-owned **F.P. Journe** and **De Bethune** listings across the major watch marketplaces and auction houses. Every Monday it sends two brand-specific email digests — one per brand — with photos, titles, prices, and direct links to every active listing found.
 
 Built and maintained by [The 1916 Company](https://www.1916company.com).
 
@@ -8,7 +8,7 @@ Built and maintained by [The 1916 Company](https://www.1916company.com).
 
 ## What It Does
 
-- Scrapes 14 sources every Monday at 7:30 AM Eastern via GitHub Actions
+- Scrapes 13 sources every Monday at 7:30 AM Eastern via GitHub Actions
 - Sends two HTML email digests (one F.P. Journe, one De Bethune) with a photo grid of available listings
 - Tracks upcoming auction lots separately (Phillips) with estimates, sale dates, and locations
 - Deduplicates listings across sources so the same watch doesn't appear twice
@@ -29,7 +29,6 @@ Built and maintained by [The 1916 Company](https://www.1916company.com).
 | **WatchX NYC** | Shopify `/products.json` |
 | **Hodinkee Shop** | Shopify `/products.json` |
 | **WatchFinder** | HTML scraping (BeautifulSoup) |
-| **WatchBox** | HTML scraping (BeautifulSoup) |
 | **European Watch Co.** | Next.js RSC JSON extraction |
 | **WristCheck** | Playwright + SSR title fetch |
 | **Bezel** | Playwright + `__NEXT_DATA__` JSON |

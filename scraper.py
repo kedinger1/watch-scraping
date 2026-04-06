@@ -548,42 +548,6 @@ def scrape_watchfinder(session: requests.Session) -> list[Listing]:
     return deduplicate(listings)
 
 
-# ── WatchBox ───────────────────────────────────────────────────────────────────
-def scrape_watchbox(session: requests.Session) -> list[Listing]:
-    listings: list[Listing] = []
-    BASE = "https://www.thewatchbox.com"
-    queries = [
-        ("FP Journe",  f"{BASE}/search?q=fp+journe"),
-        ("De Bethune", f"{BASE}/search?q=de+bethune"),
-    ]
-    for brand, url in queries:
-        resp = fetch(url, session)
-        if not resp:
-            continue
-        soup = BeautifulSoup(resp.text, "lxml")
-        cards = soup.select(
-            ".product-card, .watch-item, "
-            "[class*='product-grid-item'], [class*='listing-card']"
-        )
-        log.info("WatchBox %s: %d cards", brand, len(cards))
-        for card in cards:
-            a = card.find("a", href=True)
-            if not a:
-                continue
-            href = abs_url(a["href"], BASE)
-            title_el = card.select_one("h2, h3, [class*='name'], [class*='title']")
-            title = title_el.get_text(" ", strip=True) if title_el else "Unknown"
-            price_el = card.select_one("[class*='price']")
-            price = price_el.get_text(" ", strip=True) if price_el else "—"
-            img_url = best_img(card.find("img"))
-            listings.append(Listing(
-                title=title, price=price, image_url=img_url,
-                listing_url=href, source="WatchBox", brand=brand,
-            ))
-        time.sleep(1)
-    return deduplicate(listings)
-
-
 # ── European Watch Company ─────────────────────────────────────────────────────
 def _ewc_parse_next_json(html: str) -> list[dict]:
     """
@@ -1370,7 +1334,6 @@ SCRAPERS = [
         s, "https://shop.hodinkee.com", "Hodinkee Shop"
     )),
     ("WatchFinder",            scrape_watchfinder),
-    ("WatchBox",               scrape_watchbox),
     ("European Watch Co.",     scrape_european_watch_co),
     ("WristCheck",             scrape_wristcheck),
     ("Bezel",                  scrape_bezel),
