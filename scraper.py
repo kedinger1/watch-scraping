@@ -28,7 +28,6 @@ from html import escape
 from typing import Optional
 from urllib.parse import quote_plus
 
-import chrono24 as c24
 import requests
 import resend
 from bs4 import BeautifulSoup
@@ -136,37 +135,126 @@ def best_img(tag) -> str:
 # ── Chrono24 ───────────────────────────────────────────────────────────────────
 def scrape_chrono24(session: requests.Session) -> list[Listing]:
     """
-    Uses the `chrono24` Python library which correctly handles Chrono24's
-    session/anti-bot layer and returns structured JSON — no HTML parsing.
-    120 listings per page; we fetch up to MAX_PAGES pages per brand.
+    Chrono24 uses Cloudflare bot protection — requests-based approaches get
+    a 403 before any HTML is served. Playwright + playwright-stealth runs a real
+    browser JS engine and patches all webdriver detection signals.
+
+    Search URL: /search/index.htm?dosearch=true&query={brand}&sortorder=5&pageSize=120
+    Listing card selector: .js-listing-item-link (120 per page)
+    Card container:        .wt-search-result / .listing-item
     """
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
+        from playwright_stealth import Stealth
+    except ImportError as e:
+        log.warning("Chrono24: missing dependency (%s) — skipping", e)
+        return []
+
     listings: list[Listing] = []
     queries = [
         ("FP Journe",  "F.P. Journe"),
         ("De Bethune", "De Bethune"),
     ]
-    for brand, query in queries:
-        try:
-            results = c24.query(query).search(limit=MAX_PAGES * 120)
-            log.info("Chrono24 %s: %d listings", brand, len(results))
-            for r in results:
-                img_url = ""
-                imgs = r.get("image_urls") or []
-                if imgs:
-                    img_url = imgs[0]
-                raw_url = r.get("url", "")
-                full_url = abs_url(raw_url, "https://www.chrono24.com")
-                listings.append(Listing(
-                    title=r.get("title", "Unknown"),
-                    price=r.get("price", "—"),
-                    image_url=img_url,
-                    listing_url=full_url,
-                    source="Chrono24",
-                    brand=brand,
-                ))
-        except Exception as exc:
-            log.error("Chrono24 %s failed: %s", brand, exc)
-        time.sleep(2)
+    pw_stealth = Stealth()
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+
+        for brand, query in queries:
+            ctx = browser.new_context(
+                user_agent=HEADERS["User-Agent"],
+                viewport={"width": 1440, "height": 900},
+                locale="en-US",
+            )
+            page = ctx.new_page()
+            pw_stealth.apply_stealth_sync(page)
+
+            url = (
+                "https://www.chrono24.com/search/index.htm"
+                f"?dosearch=true&query={quote_plus(query)}&sortorder=5&pageSize=120"
+            )
+            try:
+                page.goto(url, wait_until="networkidle", timeout=60_000)
+                page.wait_for_selector(".js-listing-item-link", timeout=30_000)
+
+                items = page.evaluate("""() => {
+                    const seen = new Set();
+                    const out = [];
+                    document.querySelectorAll(".js-listing-item-link").forEach(a => {
+                        const href = a.href;
+                        if (!href || seen.has(href)) return;
+                        seen.add(href);
+                        const card = a.closest(
+                            ".wt-search-result, .listing-item, .js-listing-item"
+                        ) || a;
+                        const img = card.querySelector(
+                            ".watch-image img, .listing-item-image img, img"
+                        );
+                        const texts = Array.from(card.querySelectorAll("*"))
+                            .filter(el => el.children.length === 0)
+                            .map(el => el.textContent.trim())
+                            .filter(t => t.length > 1);
+                        out.push({
+                            url:    href,
+                            imgSrc: img ? (img.src || img.dataset.src || "") : "",
+                            texts:  texts,
+                        });
+                    });
+                    return out;
+                }""")
+
+                log.info("Chrono24 %s: %d listings", brand, len(items))
+
+                for item in items:
+                    texts = item.get("texts", [])
+
+                    # Title: find the text that contains the brand name, then
+                    # append the next text (model name) if it isn't a price.
+                    title = "Unknown"
+                    for i, t in enumerate(texts):
+                        if detect_brand(t):
+                            parts = [t]
+                            if i + 1 < len(texts):
+                                nxt = texts[i + 1]
+                                if "$" not in nxt and "price" not in nxt.lower() and len(nxt) > 3:
+                                    parts.append(nxt)
+                            title = " ".join(parts)
+                            break
+
+                    price = next(
+                        (t for t in texts if "$" in t and any(c.isdigit() for c in t)),
+                        next((t for t in texts if "price on request" in t.lower()), "—"),
+                    )
+
+                    img_url = item.get("imgSrc", "")
+                    # Upgrade to a larger thumbnail for the email digest
+                    img_url = img_url.replace("-Square28.", "-Square40.") if img_url else ""
+
+                    listings.append(Listing(
+                        title=title,
+                        price=price,
+                        image_url=img_url,
+                        listing_url=item.get("url", ""),
+                        source="Chrono24",
+                        brand=brand,
+                    ))
+
+            except PwTimeout:
+                log.warning("Chrono24 timed out for %s", brand)
+            except Exception as exc:
+                log.error("Chrono24 %s failed: %s", brand, exc)
+            finally:
+                ctx.close()
+            time.sleep(2)
+
+        browser.close()
 
     return deduplicate(listings)
 
