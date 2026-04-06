@@ -22,7 +22,7 @@ import subprocess
 import sys
 import time
 import webbrowser
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from html import escape
 from typing import Optional
@@ -70,8 +70,9 @@ class Listing:
     listing_url: str
     source: str
     brand: str  # "FP Journe" | "De Bethune"
-    reference_number: str = ""  # e.g. "FPJ-39-RG" — populated where available
-    first_seen_at: str = ""     # "Apr 6, 2026" — populated from Supabase after upsert
+    reference_number: str = ""        # e.g. "FPJ-39-RG" — populated where available
+    first_seen_at: str = ""           # "Apr 6, 2026" — populated from Supabase after upsert
+    also_on: list[str] = field(default_factory=list)  # other sources carrying same watch
 
     def dedup_key(self) -> str:
         """Stable key for deduplication across scrapers."""
@@ -1329,6 +1330,45 @@ def deduplicate(listings: list[Listing]) -> list[Listing]:
     return out
 
 
+# ── Cross-platform deduplication ──────────────────────────────────────────────
+def cross_platform_dedup(listings: list[Listing]) -> list[Listing]:
+    """
+    Collapse listings that appear on multiple platforms with identical
+    brand + price + normalized title into a single row.
+
+    The first-seen listing is kept; subsequent duplicates are dropped and
+    their source names are added to the kept listing's `also_on` list.
+
+    Normalization: lowercase, collapse whitespace, strip punctuation noise
+    so minor formatting differences don't prevent matching.
+    """
+    def norm(s: str) -> str:
+        s = s.lower().strip()
+        s = re.sub(r"[^\w\s]", " ", s)   # punctuation → space
+        s = re.sub(r"\s+", " ", s)        # collapse whitespace
+        return s
+
+    # Key: (brand, normalized_title, price)
+    seen: dict[tuple, Listing] = {}
+    out: list[Listing] = []
+
+    for lst in listings:
+        key = (lst.brand, norm(lst.title), lst.price)
+        if key in seen:
+            # Duplicate — record source on the kept listing
+            kept = seen[key]
+            if lst.source not in kept.also_on and lst.source != kept.source:
+                kept.also_on.append(lst.source)
+        else:
+            seen[key] = lst
+            out.append(lst)
+
+    dupes = len(listings) - len(out)
+    if dupes:
+        log.info("Cross-platform dedup: removed %d duplicate(s) across sources", dupes)
+    return out
+
+
 # ── Main Gathering ─────────────────────────────────────────────────────────────
 SCRAPERS = [
     ("Chrono24",               scrape_chrono24),
@@ -1408,6 +1448,7 @@ def gather_all(
             log.error("Phillips scraper crashed: %s", exc)
             stats.append({"source": "Phillips (upcoming)", "count": 0, "fpj": 0, "db": 0, "error": str(exc)})
 
+    all_listings = cross_platform_dedup(all_listings)
     return all_listings, auction_lots, stats
 
 
@@ -1483,8 +1524,15 @@ def listing_table_html(brand_listings: list[Listing]) -> str:
             f'</td>'
             f'<td style="padding:10px 8px;vertical-align:middle;white-space:nowrap;'
             f'font-weight:700;color:#2a6b2a;font-size:15px;">{escape(l.price)}</td>'
-            f'<td style="padding:10px 8px;vertical-align:middle;color:#777;font-size:12px;'
-            f'white-space:nowrap;">{escape(l.source)}</td>'
+            f'<td style="padding:10px 8px;vertical-align:middle;color:#777;font-size:12px;">'
+            f'{escape(l.source)}'
+            + (
+                f'<br><span style="color:#bbb;font-size:10px;">also: '
+                + escape(", ".join(l.also_on))
+                + '</span>'
+                if l.also_on else ""
+            )
+            + f'</td>'
             f'{found_cell}'
             f'</tr>'
         )
@@ -1622,7 +1670,8 @@ def build_email(
     for l in b_listings:
         lines.append(f"  {l.title}")
         found = f" · found {l.first_seen_at}" if l.first_seen_at else ""
-        lines.append(f"  {l.price} | {l.source}{found}")
+        also = f" · also: {', '.join(l.also_on)}" if l.also_on else ""
+        lines.append(f"  {l.price} | {l.source}{also}{found}")
         lines.append(f"  {l.listing_url}\n")
     if b_lots:
         lines.append(f"── Phillips Upcoming ({n_lots}) ──")
