@@ -8,11 +8,12 @@ Built and maintained by [The 1916 Company](https://www.1916company.com).
 
 ## What It Does
 
-- Scrapes 14 sources every day at 8:00 AM Mountain Time via GitHub Actions
+- Scrapes 14 sources every Monday at 7:30 AM Eastern via GitHub Actions
 - Sends two HTML email digests (one F.P. Journe, one De Bethune) with a photo grid of available listings
 - Tracks upcoming auction lots separately (Phillips) with estimates, sale dates, and locations
 - Deduplicates listings across sources so the same watch doesn't appear twice
 - Filters out sold-out listings automatically
+- Persists all listings to a Supabase PostgreSQL database with price history tracking and inactive marking
 
 ---
 
@@ -53,12 +54,13 @@ scraper.py
 ```python
 @dataclass
 class Listing:
-    title:       str   # e.g. "2024 F.P. Journe Octa Automatique Reserve Lune"
-    price:       str   # e.g. "$42,500"
-    image_url:   str
-    listing_url: str
-    source:      str   # e.g. "Bezel"
-    brand:       str   # "FP Journe" | "De Bethune"
+    title:            str   # e.g. "2024 F.P. Journe Octa Automatique Reserve Lune"
+    price:            str   # e.g. "$42,500"
+    image_url:        str
+    listing_url:      str
+    source:           str   # e.g. "Bezel"
+    brand:            str   # "FP Journe" | "De Bethune"
+    reference_number: str   # e.g. "FPJ-39-RG" — populated where available
 
 @dataclass
 class AuctionLot:
@@ -95,8 +97,10 @@ playwright install chromium --with-deps
 | `RECIPIENT_EMAIL` | Destination address for the digests |
 | `EBAY_CLIENT_ID` | eBay Developer App Client ID |
 | `EBAY_CLIENT_SECRET` | eBay Developer App Client Secret |
+| `SUPABASE_URL` | Supabase project URL, e.g. `https://xxxx.supabase.co` |
+| `SUPABASE_KEY` | Supabase **service role** secret key (server-side writes) |
 
-For GitHub Actions, add all five as **repository secrets** under
+For GitHub Actions, add all seven as **repository secrets** under
 `Settings → Secrets and variables → Actions`.
 
 ### 3. Schedule
@@ -142,6 +146,43 @@ python scraper.py --list-sources
 
 ---
 
+## Database
+
+Listings are persisted to Supabase PostgreSQL on every full run. Run the following SQL once in your Supabase SQL editor to create the schema:
+
+```sql
+CREATE TABLE listings (
+    url              TEXT PRIMARY KEY,
+    source           TEXT NOT NULL,
+    brand            TEXT NOT NULL,
+    title            TEXT,
+    reference_number TEXT,
+    image_url        TEXT,
+    price            TEXT,
+    price_amount     NUMERIC,
+    first_seen_at    TIMESTAMPTZ DEFAULT NOW(),
+    last_seen_at     TIMESTAMPTZ DEFAULT NOW(),
+    is_active        BOOLEAN DEFAULT TRUE
+);
+
+CREATE TABLE price_history (
+    id           BIGSERIAL PRIMARY KEY,
+    listing_url  TEXT NOT NULL REFERENCES listings(url),
+    price        TEXT NOT NULL,
+    price_amount NUMERIC,
+    scraped_at   TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+**What gets written each run:**
+- Every active listing is upserted (insert or update) keyed on its URL
+- A `price_history` row is written whenever a listing's price changes (or it's first seen)
+- Listings that were previously active but not seen this run are marked `is_active = false`
+
+Reference numbers are captured from sources that expose them: Bezel (`referenceNumber`), WatchFinder (`ModelNumber`), Shopify (variant SKU), and European Watch Co. (reference field).
+
+---
+
 ## Stack
 
 - **Python 3.12**
@@ -149,4 +190,5 @@ python scraper.py --list-sources
 - [`playwright`](https://playwright.dev/python/) — headless Chromium for JS-rendered sites
 - [`playwright-stealth`](https://pypi.org/project/playwright-stealth/) — patches Playwright to bypass bot detection (used for Chrono24, Bezel, WristCheck)
 - [`resend`](https://resend.com/docs) — transactional email delivery
+- [`supabase`](https://supabase.com/docs/reference/python) — PostgreSQL persistence (listings + price history)
 - **GitHub Actions** — scheduling and execution (free tier)

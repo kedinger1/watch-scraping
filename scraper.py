@@ -70,6 +70,7 @@ class Listing:
     listing_url: str
     source: str
     brand: str  # "FP Journe" | "De Bethune"
+    reference_number: str = ""  # e.g. "FPJ-39-RG" — populated where available
 
     def dedup_key(self) -> str:
         """Stable key for deduplication across scrapers."""
@@ -440,9 +441,13 @@ def scrape_shopify_store(
                 handle = p.get("handle", "")
                 listing_url = f"{base_url}/products/{handle}"
 
+                # SKU is the closest thing Shopify has to a reference number
+                ref_num = variants[0].get("sku", "") if variants else ""
+
                 listings.append(Listing(
                     title=title, price=price, image_url=img_url,
                     listing_url=listing_url, source=source_name, brand=brand,
+                    reference_number=ref_num or "",
                 ))
             page += 1
             time.sleep(0.5)
@@ -532,6 +537,7 @@ def scrape_watchfinder(session: requests.Session) -> list[Listing]:
                     listing_url=listing_url,
                     source="WatchFinder",
                     brand=brand,
+                    reference_number=model_num or "",
                 ))
 
             page += 1
@@ -681,9 +687,17 @@ def scrape_european_watch_co(session: requests.Session) -> list[Listing]:
             slug = item.get("slug", "")
             listing_url = f"{BASE}/watch/{slug}" if slug else BASE
 
+            # EWC stores the manufacturer reference number under several possible keys
+            ref_num = (
+                str(item.get("reference_number") or "")
+                or str(item.get("reference") or "")
+                or str(item.get("model_reference") or "")
+            )
+
             listings.append(Listing(
                 title=title, price=price, image_url=img_url,
                 listing_url=listing_url, source="European Watch Co.", brand=detected,
+                reference_number=ref_num,
             ))
 
         time.sleep(1)
@@ -959,6 +973,8 @@ def scrape_bezel(session: requests.Session) -> list[Listing]:
                         break
 
             listing_url = f"{url_base}/listing/id-{listing_id}"
+            ref_num = str(lst.get("referenceNumber") or model_info.get("referenceNumber") or "")
+
             listings.append(Listing(
                 title=title,
                 price=price,
@@ -966,6 +982,7 @@ def scrape_bezel(session: requests.Session) -> list[Listing]:
                 listing_url=listing_url,
                 source="Bezel",
                 brand=brand,
+                reference_number=ref_num,
             ))
 
         time.sleep(0.5)
@@ -1180,6 +1197,145 @@ def scrape_phillips(session: requests.Session) -> list[AuctionLot]:
         time.sleep(1)
 
     return lots
+
+
+# ── Price parsing helper ───────────────────────────────────────────────────────
+def _parse_price_amount(price_str: str) -> Optional[float]:
+    """
+    Convert a human-readable price string to a float for DB storage.
+    "$42,500"   → 42500.0
+    "$1,200,000"→ 1200000.0
+    "POA" / "—" → None
+    """
+    if not price_str:
+        return None
+    cleaned = re.sub(r"[^\d.]", "", price_str)
+    try:
+        return float(cleaned) if cleaned else None
+    except ValueError:
+        return None
+
+
+# ── Supabase persistence ───────────────────────────────────────────────────────
+def save_to_supabase(listings: list[Listing]) -> None:
+    """
+    Upsert all active listings to Supabase, record price history on changes,
+    and mark any previously-active listings that were NOT seen this run as inactive.
+
+    Table schema (run once in the Supabase SQL editor):
+    ─────────────────────────────────────────────────────────────────────────────
+    CREATE TABLE listings (
+        url              TEXT PRIMARY KEY,
+        source           TEXT NOT NULL,
+        brand            TEXT NOT NULL,
+        title            TEXT,
+        reference_number TEXT,
+        image_url        TEXT,
+        price            TEXT,
+        price_amount     NUMERIC,
+        first_seen_at    TIMESTAMPTZ DEFAULT NOW(),
+        last_seen_at     TIMESTAMPTZ DEFAULT NOW(),
+        is_active        BOOLEAN DEFAULT TRUE
+    );
+
+    CREATE TABLE price_history (
+        id           BIGSERIAL PRIMARY KEY,
+        listing_url  TEXT NOT NULL REFERENCES listings(url),
+        price        TEXT NOT NULL,
+        price_amount NUMERIC,
+        scraped_at   TIMESTAMPTZ DEFAULT NOW()
+    );
+    ─────────────────────────────────────────────────────────────────────────────
+    """
+    url_env = os.environ.get("SUPABASE_URL", "")
+    key_env = os.environ.get("SUPABASE_KEY", "")
+    if not url_env or not key_env:
+        log.warning("SUPABASE_URL / SUPABASE_KEY not set — skipping DB save")
+        return
+
+    try:
+        from supabase import create_client
+    except ImportError:
+        log.warning("supabase package not installed — skipping DB save")
+        return
+
+    try:
+        sb = create_client(url_env, key_env)
+    except Exception as exc:
+        log.error("Supabase client init failed: %s", exc)
+        return
+
+    # ── 1. Fetch current prices for all listings in DB so we know what changed ──
+    try:
+        existing_resp = sb.table("listings").select("url, price, is_active").execute()
+        existing: dict[str, dict] = {
+            row["url"]: row for row in (existing_resp.data or [])
+        }
+    except Exception as exc:
+        log.error("Supabase fetch existing listings failed: %s", exc)
+        existing = {}
+
+    # ── 2. Upsert each listing ──────────────────────────────────────────────────
+    seen_urls: set[str] = set()
+    price_history_rows: list[dict] = []
+
+    for lst in listings:
+        url_key = lst.dedup_key()
+        seen_urls.add(url_key)
+        price_amount = _parse_price_amount(lst.price)
+
+        row = {
+            "url":              url_key,
+            "source":           lst.source,
+            "brand":            lst.brand,
+            "title":            lst.title,
+            "reference_number": lst.reference_number or None,
+            "image_url":        lst.image_url or None,
+            "price":            lst.price,
+            "price_amount":     price_amount,
+            "last_seen_at":     "now()",
+            "is_active":        True,
+        }
+
+        try:
+            sb.table("listings").upsert(row, on_conflict="url").execute()
+        except Exception as exc:
+            log.warning("Supabase upsert failed for %s: %s", url_key[:60], exc)
+            continue
+
+        # Record price history when price changes (or listing is brand-new)
+        prev = existing.get(url_key)
+        if prev is None or prev.get("price") != lst.price:
+            price_history_rows.append({
+                "listing_url":  url_key,
+                "price":        lst.price,
+                "price_amount": price_amount,
+            })
+
+    # ── 3. Bulk-insert price history rows ──────────────────────────────────────
+    if price_history_rows:
+        try:
+            sb.table("price_history").insert(price_history_rows).execute()
+            log.info("Supabase: recorded %d price history row(s)", len(price_history_rows))
+        except Exception as exc:
+            log.warning("Supabase price_history insert failed: %s", exc)
+
+    # ── 4. Mark listings not seen this run as inactive ──────────────────────────
+    stale_urls = [
+        u for u, r in existing.items()
+        if r.get("is_active") and u not in seen_urls
+    ]
+    if stale_urls:
+        try:
+            sb.table("listings").update({"is_active": False}).in_("url", stale_urls).execute()
+            log.info("Supabase: marked %d listing(s) inactive", len(stale_urls))
+        except Exception as exc:
+            log.warning("Supabase mark-inactive failed: %s", exc)
+
+    log.info(
+        "Supabase: upserted %d listing(s) (%d price change(s), %d marked inactive)",
+        len(seen_urls), len(price_history_rows), len(stale_urls),
+    )
 
 
 # ── Deduplication ──────────────────────────────────────────────────────────────
@@ -1636,6 +1792,10 @@ if __name__ == "__main__":
     db_count  = sum(1 for l in listings if l.brand == "De Bethune")
     log.info("Total: %d listings (%d FPJ, %d DB) + %d Phillips lot(s)",
              len(listings), fpj_count, db_count, len(auction_lots))
+
+    # Persist to Supabase (only when running a full scrape or in CI)
+    if not args.source:
+        save_to_supabase(listings)
 
     if skip_email:
         print_console_summary(listings, auction_lots, stats)
