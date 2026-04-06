@@ -20,7 +20,7 @@ Built and maintained by [The 1916 Company](https://www.1916company.com).
 
 | Source | Method |
 |---|---|
-| **Chrono24** | `chrono24` Python library |
+| **Chrono24** | Playwright + stealth (Cloudflare bypass) |
 | **eBay** | eBay Browse API (OAuth) |
 | **A Collected Man** | Shopify `/products.json` |
 | **Wrist Aficionado** | Shopify `/products.json` |
@@ -147,6 +147,6 @@ python scraper.py --list-sources
 - **Python 3.12**
 - [`requests`](https://docs.python-requests.org) + [`beautifulsoup4`](https://www.crummy.com/software/BeautifulSoup/) — HTTP and HTML parsing
 - [`playwright`](https://playwright.dev/python/) — headless Chromium for JS-rendered sites
-- [`chrono24`](https://pypi.org/project/chrono24/) — Chrono24 search library
+- [`playwright-stealth`](https://pypi.org/project/playwright-stealth/) — patches Playwright to bypass bot detection (used for Chrono24, Bezel, WristCheck)
 - [`resend`](https://resend.com/docs) — transactional email delivery
 - **GitHub Actions** — scheduling and execution (free tier)
