@@ -71,6 +71,7 @@ class Listing:
     source: str
     brand: str  # "FP Journe" | "De Bethune"
     reference_number: str = ""  # e.g. "FPJ-39-RG" — populated where available
+    first_seen_at: str = ""     # "Apr 6, 2026" — populated from Supabase after upsert
 
     def dedup_key(self) -> str:
         """Stable key for deduplication across scrapers."""
@@ -1229,9 +1230,9 @@ def save_to_supabase(listings: list[Listing]) -> None:
         log.error("Supabase client init failed: %s", exc)
         return
 
-    # ── 1. Fetch current prices for all listings in DB so we know what changed ──
+    # ── 1. Fetch current state of all listings in DB ───────────────────────────
     try:
-        existing_resp = sb.table("listings").select("url, price, is_active").execute()
+        existing_resp = sb.table("listings").select("url, price, is_active, first_seen_at").execute()
         existing: dict[str, dict] = {
             row["url"]: row for row in (existing_resp.data or [])
         }
@@ -1267,8 +1268,22 @@ def save_to_supabase(listings: list[Listing]) -> None:
             log.warning("Supabase upsert failed for %s: %s", url_key[:60], exc)
             continue
 
-        # Record price history when price changes (or listing is brand-new)
+        # Populate first_seen_at on the listing object for use in the email
         prev = existing.get(url_key)
+        if prev and prev.get("first_seen_at"):
+            # Parse ISO timestamp from DB → "Apr 6, 2026"
+            try:
+                from datetime import datetime, timezone
+                dt = datetime.fromisoformat(prev["first_seen_at"].replace("Z", "+00:00"))
+                lst.first_seen_at = f"{dt.strftime('%b')} {dt.day}, {dt.year}"
+            except Exception:
+                lst.first_seen_at = prev["first_seen_at"][:10]
+        else:
+            # Brand-new listing — first seen today
+            today = date.today()
+            lst.first_seen_at = f"{today.strftime('%b')} {today.day}, {today.year}"
+
+        # Record price history when price changes (or listing is brand-new)
         if prev is None or prev.get("price") != lst.price:
             price_history_rows.append({
                 "listing_url":  url_key,
@@ -1451,6 +1466,13 @@ def listing_table_html(brand_listings: list[Listing]) -> str:
         else:
             img_cell = "&nbsp;"
 
+        found_cell = (
+            f'<td style="padding:10px 8px;vertical-align:middle;color:#999;font-size:11px;'
+            f'white-space:nowrap;">{escape(l.first_seen_at)}</td>'
+            if l.first_seen_at else
+            f'<td style="padding:10px 8px;vertical-align:middle;color:#ddd;font-size:11px;">—</td>'
+        )
+
         rows.append(
             f'<tr style="border-bottom:1px solid #ede8e0;">'
             f'<td style="padding:10px 8px;width:96px;vertical-align:middle;">{img_cell}</td>'
@@ -1463,6 +1485,7 @@ def listing_table_html(brand_listings: list[Listing]) -> str:
             f'font-weight:700;color:#2a6b2a;font-size:15px;">{escape(l.price)}</td>'
             f'<td style="padding:10px 8px;vertical-align:middle;color:#777;font-size:12px;'
             f'white-space:nowrap;">{escape(l.source)}</td>'
+            f'{found_cell}'
             f'</tr>'
         )
 
@@ -1480,6 +1503,8 @@ def listing_table_html(brand_listings: list[Listing]) -> str:
         'font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Price</th>'
         '<th style="padding:9px 8px;text-align:left;font-size:11px;color:#999;'
         'font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Source</th>'
+        '<th style="padding:9px 8px;text-align:left;font-size:11px;color:#999;'
+        'font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Date Found</th>'
         '</tr>'
         '</thead>'
         '<tbody>' + "".join(rows) + "</tbody>"
@@ -1596,7 +1621,8 @@ def build_email(
     lines = [f"{display} Listings — {today}", f"{n_list} listing(s)\n"]
     for l in b_listings:
         lines.append(f"  {l.title}")
-        lines.append(f"  {l.price} | {l.source}")
+        found = f" · found {l.first_seen_at}" if l.first_seen_at else ""
+        lines.append(f"  {l.price} | {l.source}{found}")
         lines.append(f"  {l.listing_url}\n")
     if b_lots:
         lines.append(f"── Phillips Upcoming ({n_lots}) ──")
