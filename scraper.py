@@ -1228,11 +1228,17 @@ def gather_all(
             results = scraper_fn(session)
             new = [r for r in results if r.dedup_key() not in {x.dedup_key() for x in all_listings}]
             all_listings.extend(new)
-            stats.append({"source": name, "count": len(results), "error": None})
+            stats.append({
+                "source": name,
+                "count":  len(results),
+                "fpj":    sum(1 for r in results if r.brand == "FP Journe"),
+                "db":     sum(1 for r in results if r.brand == "De Bethune"),
+                "error":  None,
+            })
             log.info("   → %d listings (%d after global dedup)", len(results), len(new))
         except Exception as exc:
             log.error("Scraper %s crashed: %s", name, exc)
-            stats.append({"source": name, "count": 0, "error": str(exc)})
+            stats.append({"source": name, "count": 0, "fpj": 0, "db": 0, "error": str(exc)})
 
     # Phillips runs separately — returns AuctionLot, not Listing
     if not only_source or "phillips" in (only_source or "").lower():
@@ -1240,11 +1246,17 @@ def gather_all(
         try:
             lots = scrape_phillips(session)
             auction_lots.extend(lots)
-            stats.append({"source": "Phillips (upcoming)", "count": len(lots), "error": None})
+            stats.append({
+                "source": "Phillips (upcoming)",
+                "count":  len(lots),
+                "fpj":    sum(1 for l in lots if l.brand == "FP Journe"),
+                "db":     sum(1 for l in lots if l.brand == "De Bethune"),
+                "error":  None,
+            })
             log.info("   → %d upcoming lot(s)", len(lots))
         except Exception as exc:
             log.error("Phillips scraper crashed: %s", exc)
-            stats.append({"source": "Phillips (upcoming)", "count": 0, "error": str(exc)})
+            stats.append({"source": "Phillips (upcoming)", "count": 0, "fpj": 0, "db": 0, "error": str(exc)})
 
     return all_listings, auction_lots, stats
 
@@ -1386,10 +1398,13 @@ def auction_table_html(lots: list[AuctionLot]) -> str:
     )
 
 
-def stats_table_html(stats: list[dict]) -> str:
+def stats_table_html(stats: list[dict], brand: str) -> str:
+    """Render the source breakdown table filtered to one brand's counts."""
+    brand_key = "fpj" if brand == "FP Journe" else "db"
     rows = []
     for s in stats:
-        color = "#2a6b2a" if s["count"] > 0 else "#bbb"
+        n = s.get(brand_key, s.get("count", 0))
+        color = "#2a6b2a" if n > 0 else "#bbb"
         err = (
             f' <span style="color:#b94040;font-size:11px;">({escape(str(s["error"]))})</span>'
             if s["error"] else ""
@@ -1397,7 +1412,7 @@ def stats_table_html(stats: list[dict]) -> str:
         rows.append(
             f'<tr>'
             f'<td style="padding:5px 8px;">{escape(s["source"])}</td>'
-            f'<td style="padding:5px 8px;font-weight:600;color:{color};">{s["count"]}{err}</td>'
+            f'<td style="padding:5px 8px;font-weight:600;color:{color};">{n}{err}</td>'
             f'</tr>'
         )
     return (
@@ -1432,7 +1447,8 @@ def build_email(
     b_lots       = [l for l in auction_lots if l.brand == brand]
     n_list       = len(b_listings)
     n_lots       = len(b_lots)
-    active_src   = len([s for s in stats if s["count"] > 0])
+    brand_key    = "fpj" if brand == "FP Journe" else "db"
+    active_src   = sum(1 for s in stats if s.get(brand_key, s.get("count", 0)) > 0)
 
     subject = (
         f"{display} Listings — {today} "
@@ -1502,7 +1518,7 @@ def build_email(
 
   <div style="margin-top:40px;border-top:1px solid #e8e8e8;padding-top:16px;">
     <p style="font-size:12px;color:#bbb;margin:0 0 8px;">Source breakdown</p>
-    {stats_table_html(stats)}
+    {stats_table_html(stats, brand)}
   </div>
 
 </body>
