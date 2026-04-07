@@ -194,11 +194,15 @@ def scrape_chrono24(session: requests.Session) -> list[Listing]:
                 try:
                     page.wait_for_selector(".js-listing-item-link", timeout=45_000)
                 except PwTimeout:
+                    title = page.title()
                     log.warning(
                         "Chrono24 %s: listing selector not found — page title: %r",
-                        brand, page.title(),
+                        brand, title,
                     )
                     ctx.close()
+                    # Cloudflare challenge = definitive block, not empty results
+                    if "moment" in title.lower() or "cloudflare" in title.lower() or "just a" in title.lower():
+                        raise RuntimeError(f"Blocked by Cloudflare ({title!r})")
                     continue
 
                 items = page.evaluate("""() => {
@@ -315,7 +319,7 @@ def scrape_ebay(session: requests.Session) -> list[Listing]:
     """
     token = _ebay_app_token()
     if not token:
-        return []
+        raise RuntimeError("eBay token fetch failed — check EBAY_CLIENT_ID / EBAY_CLIENT_SECRET")
 
     listings: list[Listing] = []
     api_headers = {
