@@ -795,163 +795,214 @@ def scrape_wristcheck(session: requests.Session) -> list[Listing]:
 # ── Bezel ──────────────────────────────────────────────────────────────────────
 def scrape_bezel(session: requests.Session) -> list[Listing]:
     """
-    Bezel (shop.getbezel.com) two-phase approach:
+    Bezel (shop.getbezel.com) — all Playwright, single browser session.
 
-    Phase 1 — Playwright loads the explore pages and collects model-page URLs.
-      Explore pages: /explore/fp-journe, /explore/de-bethune
-      Model pages end with /id-{model_id}  (one page per reference/watch model)
+    Phase 1 — paginate through /explore/{brand} pages, reading __NEXT_DATA__
+      to collect model IDs and their active listing counts.  Only models with
+      count > 0 are queued for Phase 2.
 
-    Phase 2 — Each model page is fetched statically (no Playwright needed).
-      Bezel embeds full listing data in a <script id="__NEXT_DATA__"> tag:
-        props.pageProps.listings[]
-          .id             → individual listing ID
-          .model.name     → model name (e.g. "Octa Automatique Reserve Lune")
-          .manufactureYear→ year (e.g. 2024)
-          .priceCents     → price in cents
-          .status         → "PUBLISHED" = active
-          .active         → bool
-          .images[]       → listing-specific photos (bunnyUrl / cloudinaryUrl)
+    Phase 2 — navigate to each model page inside the same Playwright context
+      (required to bypass Cloudflare/reCAPTCHA that blocks raw requests).
+      Listing data is embedded in __NEXT_DATA__ → props.pageProps.listings[].
 
-    Individual listing URL: /watches/{brand}/{model}/ref-{ref}/listing/id-{listing_id}
-    Full title:  "{year} {Brand Display} {model.name}"
+    Key fields per listing:
+      .id              → listing ID  (used for URL)
+      .model.name      → model name
+      .manufactureYear → production year
+      .priceCents      → price in cents
+      .status          → "PUBLISHED" = active
+      .active          → bool
+      .images[]        → listing-specific photos
     """
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
     except ImportError:
-        log.warning(
-            "Playwright not installed — skipping Bezel. "
-            "Run: pip install playwright && playwright install chromium"
-        )
+        log.warning("Playwright not installed — skipping Bezel.")
         return []
 
     BASE = "https://shop.getbezel.com"
-    explore_pages = [
-        ("FP Journe",  f"{BASE}/explore/fp-journe",  "F.P. Journe"),
-        ("De Bethune", f"{BASE}/explore/de-bethune", "De Bethune"),
+    explore_configs = [
+        ("FP Journe",  "fp-journe",  "F.P. Journe"),
+        ("De Bethune", "de-bethune", "De Bethune"),
     ]
-
-    # ── Phase 1: collect model-page URLs via Playwright ──────────────────────
-    # Each entry: (brand_key, brand_display, model_page_url)
-    model_pages: list[tuple[str, str, str]] = []
+    listings: list[Listing] = []
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
-        ctx = browser.new_context(user_agent=HEADERS["User-Agent"])
-        page = ctx.new_page()
 
-        for brand, explore_url, brand_display in explore_pages:
-            try:
-                page.goto(explore_url, wait_until="networkidle", timeout=45_000)
-                page.wait_for_selector('a[href*="/watches/"]', timeout=20_000)
+        for brand, brand_key, brand_display in explore_configs:
+            # Fresh context per brand — avoids accumulated state from model-page
+            # navigations in the previous brand's Phase 2 contaminating Phase 1.
+            ctx = browser.new_context(
+                user_agent=HEADERS["User-Agent"],
+                viewport={"width": 1440, "height": 900},
+            )
+            page = ctx.new_page()
+            # ── Phase 1: collect model IDs with active listings ───────────────
+            model_queue: list[tuple[str, str]] = []  # (model_url, model_slug)
+            explore_page_num = 1
 
-                hrefs = page.evaluate("""() => {
-                    const seen = new Set();
-                    const results = [];
-                    document.querySelectorAll('a[href*="/watches/"]').forEach(a => {
-                        const href = a.href;
-                        // Model pages end with /id-{number} (not /listing/id-{number})
-                        if (!/\\/id-\\d+$/.test(href)) return;
-                        if (seen.has(href)) return;
-                        seen.add(href);
-                        results.push(href);
-                    });
-                    return results;
-                }""")
+            while True:
+                # Note: ?page=1 strips listing counts from the response — use
+                # the base URL for page 1, only append ?page=N for pages 2+.
+                explore_url = (
+                    f"{BASE}/explore/{brand_key}"
+                    if explore_page_num == 1
+                    else f"{BASE}/explore/{brand_key}?page={explore_page_num}"
+                )
+                try:
+                    page.goto(explore_url, wait_until="domcontentloaded", timeout=60_000)
+                    page.wait_for_timeout(4_000)
+                    html = page.content()
+                except PwTimeout:
+                    log.warning("Bezel explore timed out: %s page %d", brand, explore_page_num)
+                    break
+                except Exception as exc:
+                    log.warning("Bezel explore error %s page %d: %s", brand, explore_page_num, exc)
+                    break
 
-                log.info("Bezel explore %s: %d model pages", brand, len(hrefs))
-                for href in hrefs:
-                    model_pages.append((brand, brand_display, href))
+                m = re.search(
+                    r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL
+                )
+                if not m:
+                    break
+                try:
+                    nd = json.loads(m.group(1))
+                    models_block = nd.get("props", {}).get("pageProps", {}).get("models", {})
+                except Exception:
+                    break
 
-            except PwTimeout:
-                log.warning("Bezel explore timed out for %s", brand)
-            except Exception as exc:
-                log.warning("Bezel explore error for %s: %s", brand, exc)
+                hits = models_block.get("hits", [])
+                if not hits:
+                    break
+
+                # Build id → URL map from all /id-N links on this explore page
+                id_to_url: dict[int, str] = {}
+                try:
+                    hrefs = page.evaluate("""() => {
+                        const out = {};
+                        document.querySelectorAll('a[href*="/id-"]').forEach(a => {
+                            const m = a.href.match(/\\/id-(\\d+)$/);
+                            if (m) out[parseInt(m[1])] = a.href;
+                        });
+                        return out;
+                    }""")
+                    id_to_url = {int(k): v for k, v in hrefs.items()}
+                except Exception:
+                    pass
+
+                for hit in hits:
+                    obj = hit.get("object", {})
+                    count = obj.get("count", 0) or 0
+                    if count <= 0:
+                        continue
+                    model_id = obj.get("id")
+                    if not model_id:
+                        continue
+                    href = id_to_url.get(model_id)
+                    if not href:
+                        # Fallback: construct URL directly from brand key + model id
+                        href = f"{BASE}/watches/{brand_key}/model/ref-/id-{model_id}"
+                    model_queue.append((href, str(model_id)))
+
+                # Check if there are more pages
+                total = models_block.get("totalModelCount", 0)
+                page_size = len(hits)
+                if explore_page_num * page_size >= total:
+                    break
+                explore_page_num += 1
+                time.sleep(0.5)
+
+            log.info("Bezel %s: %d model pages with active listings", brand, len(model_queue))
+
+            # ── Phase 2: navigate to each model page and extract listings ─────
+            for model_url, model_id_str in model_queue:
+                try:
+                    page.goto(model_url, wait_until="domcontentloaded", timeout=60_000)
+                    page.wait_for_timeout(3_000)
+                    html = page.content()
+                except PwTimeout:
+                    log.warning("Bezel model page timed out: %s", model_url)
+                    continue
+                except Exception as exc:
+                    log.warning("Bezel model page error %s: %s", model_url, exc)
+                    continue
+
+                m = re.search(
+                    r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL
+                )
+                if not m:
+                    log.warning("Bezel: no __NEXT_DATA__ at %s", model_url)
+                    continue
+                try:
+                    nd = json.loads(m.group(1))
+                    raw_listings = (
+                        nd.get("props", {}).get("pageProps", {}).get("listings", [])
+                    )
+                except Exception as exc:
+                    log.warning("Bezel JSON parse error %s: %s", model_url, exc)
+                    continue
+
+                url_base = re.sub(r"/id-\d+$", "", model_url)
+
+                for lst in raw_listings:
+                    if not lst.get("active") or lst.get("status") != "PUBLISHED":
+                        continue
+                    listing_id = lst.get("id")
+                    if not listing_id:
+                        continue
+
+                    model_info = lst.get("model", {})
+                    model_name = model_info.get("name", "")
+                    year = lst.get("manufactureYear", "")
+                    title_parts = [str(year) if year else "", brand_display, model_name]
+                    title = " ".join(p for p in title_parts if p).strip()
+
+                    price_cents = lst.get("priceCents") or 0
+                    price = f"${price_cents / 100:,.0f}" if price_cents else "—"
+
+                    img_url = ""
+                    for img_obj in lst.get("images", []):
+                        img = img_obj.get("image", {})
+                        img_url = (
+                            img.get("bunnyUrl")
+                            or img.get("cloudinaryUrl")
+                            or img.get("rawUrl", "")
+                        )
+                        if img_url:
+                            break
+                    if not img_url:
+                        for img_obj in model_info.get("images", []):
+                            img_url = (
+                                img_obj.get("bunnyUrl")
+                                or img_obj.get("cloudinaryUrl")
+                                or img_obj.get("url", "")
+                            )
+                            if img_url:
+                                break
+
+                    listing_url = f"{url_base}/listing/id-{listing_id}"
+                    ref_num = str(
+                        lst.get("referenceNumber")
+                        or model_info.get("referenceNumber")
+                        or ""
+                    )
+
+                    listings.append(Listing(
+                        title=title,
+                        price=price,
+                        image_url=img_url,
+                        listing_url=listing_url,
+                        source="Bezel",
+                        brand=brand,
+                        reference_number=ref_num,
+                    ))
+
+                time.sleep(0.5)
+
+            ctx.close()  # discard accumulated state before next brand
 
         browser.close()
-
-    # ── Phase 2: parse __NEXT_DATA__ from each model page ────────────────────
-    listings: list[Listing] = []
-
-    for brand, brand_display, model_url in model_pages:
-        resp = fetch(model_url, session)
-        if not resp:
-            continue
-
-        try:
-            m = re.search(
-                r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>',
-                resp.text,
-                re.DOTALL,
-            )
-            if not m:
-                log.warning("Bezel: no __NEXT_DATA__ at %s", model_url)
-                continue
-            data = json.loads(m.group(1))
-            raw_listings = (
-                data.get("props", {}).get("pageProps", {}).get("listings", [])
-            )
-        except Exception as exc:
-            log.warning("Bezel: JSON parse error at %s: %s", model_url, exc)
-            continue
-
-        # Base URL for constructing individual listing URLs:
-        # strip trailing /id-{model_id}, append /listing/id-{listing_id}
-        url_base = re.sub(r"/id-\d+$", "", model_url)
-
-        for lst in raw_listings:
-            if not lst.get("active") or lst.get("status") != "PUBLISHED":
-                continue
-
-            listing_id = lst.get("id")
-            if not listing_id:
-                continue
-
-            model_info = lst.get("model", {})
-            model_name = model_info.get("name", "")
-            year = lst.get("manufactureYear", "")
-
-            # Build full title: "2024 F.P. Journe Octa Automatique Reserve Lune"
-            title_parts = [str(year) if year else "", brand_display, model_name]
-            title = " ".join(p for p in title_parts if p).strip()
-
-            price_cents = lst.get("priceCents") or 0
-            price = f"${price_cents / 100:,.0f}" if price_cents else "—"
-
-            # Prefer listing-specific images; fall back to model-level images
-            img_url = ""
-            for img_obj in lst.get("images", []):
-                img = img_obj.get("image", {})
-                img_url = (
-                    img.get("bunnyUrl")
-                    or img.get("cloudinaryUrl")
-                    or img.get("rawUrl", "")
-                )
-                if img_url:
-                    break
-            if not img_url:
-                for img_obj in model_info.get("images", []):
-                    img_url = (
-                        img_obj.get("bunnyUrl")
-                        or img_obj.get("cloudinaryUrl")
-                        or img_obj.get("url", "")
-                    )
-                    if img_url:
-                        break
-
-            listing_url = f"{url_base}/listing/id-{listing_id}"
-            ref_num = str(lst.get("referenceNumber") or model_info.get("referenceNumber") or "")
-
-            listings.append(Listing(
-                title=title,
-                price=price,
-                image_url=img_url,
-                listing_url=listing_url,
-                source="Bezel",
-                brand=brand,
-                reference_number=ref_num,
-            ))
-
-        time.sleep(0.5)
 
     log.info("Bezel total: %d individual listings", len(listings))
     return deduplicate(listings)
@@ -959,39 +1010,91 @@ def scrape_bezel(session: requests.Session) -> list[Listing]:
 
 # ── 1stDibs ────────────────────────────────────────────────────────────────────
 def scrape_1stdibs(session: requests.Session) -> list[Listing]:
-    listings: list[Listing] = []
+    """
+    1stDibs is fully JS-rendered — BeautifulSoup returns an empty shell.
+    Playwright loads the search results page and extracts listing cards
+    directly from the DOM.
+
+    Search URLs:
+      /buy/luxury-watches/?q=f.p.+journe
+      /buy/luxury-watches/?q=de+bethune
+    Card selector: [data-tn="search-result-item"]
+    """
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
+    except ImportError:
+        log.warning("Playwright not installed — skipping 1stDibs")
+        return []
+
     BASE = "https://www.1stdibs.com"
     queries = [
-        ("FP Journe",  f"{BASE}/jewelry/watches/watches/?q=fp+journe"),
-        ("De Bethune", f"{BASE}/jewelry/watches/watches/?q=de+bethune"),
+        ("FP Journe",  f"{BASE}/buy/luxury-watches/?q=f.p.+journe"),
+        ("De Bethune", f"{BASE}/buy/luxury-watches/?q=de+bethune"),
     ]
-    for brand, url in queries:
-        resp = fetch(url, session)
-        if not resp:
-            continue
-        soup = BeautifulSoup(resp.text, "lxml")
-        cards = soup.select(
-            "[data-tn='search-result-item'], "
-            "[class*='item-tile'], [class*='product-tile']"
+    listings: list[Listing] = []
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        ctx = browser.new_context(
+            user_agent=HEADERS["User-Agent"],
+            viewport={"width": 1440, "height": 900},
+            locale="en-US",
         )
-        log.info("1stDibs %s: %d cards", brand, len(cards))
-        for card in cards:
-            a = card.find("a", href=True)
-            if not a:
-                continue
-            href = abs_url(a["href"], BASE)
-            title_el = card.select_one(
-                "[data-tn='item-title'], h2, h3, [class*='title']"
-            )
-            title = title_el.get_text(" ", strip=True) if title_el else "Unknown"
-            price_el = card.select_one("[data-tn='item-price'], [class*='price']")
-            price = price_el.get_text(" ", strip=True) if price_el else "—"
-            img_url = best_img(card.find("img"))
-            listings.append(Listing(
-                title=title, price=price, image_url=img_url,
-                listing_url=href, source="1stDibs", brand=brand,
-            ))
-        time.sleep(1)
+        page = ctx.new_page()
+
+        for brand, url in queries:
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+                page.wait_for_timeout(5_000)
+                page.wait_for_selector('[data-tn="search-result-item"], [class*="item-tile"]', timeout=30_000)
+
+                items = page.evaluate("""() => {
+                    const results = [];
+                    const cards = document.querySelectorAll(
+                        '[data-tn="search-result-item"], [class*="item-tile"], [class*="ItemTile"]'
+                    );
+                    cards.forEach(card => {
+                        const a = card.querySelector('a[href]');
+                        if (!a) return;
+                        const titleEl = card.querySelector(
+                            '[data-tn="item-title"], [class*="title"], [class*="Title"], h2, h3'
+                        );
+                        const priceEl = card.querySelector(
+                            '[data-tn="item-price"], [class*="price"], [class*="Price"]'
+                        );
+                        const img = card.querySelector('img');
+                        results.push({
+                            url:   a.href,
+                            title: titleEl ? titleEl.textContent.trim() : '',
+                            price: priceEl ? priceEl.textContent.trim() : '—',
+                            img:   img ? (img.src || img.dataset.src || '') : '',
+                        });
+                    });
+                    return results;
+                }""")
+
+                log.info("1stDibs %s: %d items", brand, len(items))
+                for item in items:
+                    title = item.get("title") or "Unknown"
+                    if not detect_brand(title):
+                        continue
+                    listings.append(Listing(
+                        title=title,
+                        price=item.get("price") or "—",
+                        image_url=item.get("img") or "",
+                        listing_url=item.get("url") or "",
+                        source="1stDibs",
+                        brand=brand,
+                    ))
+
+            except PwTimeout:
+                log.warning("1stDibs timed out for %s", brand)
+            except Exception as exc:
+                log.warning("1stDibs error for %s: %s", brand, exc)
+            time.sleep(2)
+
+        browser.close()
+
     return deduplicate(listings)
 
 
@@ -1227,6 +1330,7 @@ def save_to_supabase(listings: list[Listing]) -> None:
 
     try:
         sb = create_client(url_env, key_env)
+        log.info("Supabase client initialised → %s", url_env)
     except Exception as exc:
         log.error("Supabase client init failed: %s", exc)
         return
@@ -1242,6 +1346,9 @@ def save_to_supabase(listings: list[Listing]) -> None:
         existing = {}
 
     # ── 2. Upsert each listing ──────────────────────────────────────────────────
+    from datetime import datetime, timezone
+    now_iso = datetime.now(timezone.utc).isoformat()
+
     seen_urls: set[str] = set()
     price_history_rows: list[dict] = []
 
@@ -1259,7 +1366,7 @@ def save_to_supabase(listings: list[Listing]) -> None:
             "image_url":        lst.image_url or None,
             "price":            lst.price,
             "price_amount":     price_amount,
-            "last_seen_at":     "now()",
+            "last_seen_at":     now_iso,
             "is_active":        True,
         }
 
@@ -1459,16 +1566,17 @@ def print_console_summary(
     fpj = [l for l in listings if l.brand == "FP Journe"]
     db  = [l for l in listings if l.brand == "De Bethune"]
     w = 60
-    print("\n" + "━" * w)
-    print(f"  Watch Listings — {date.today():%B %d, %Y}")
-    print(f"  {len(listings)} total  ({len(fpj)} FP Journe · {len(db)} De Bethune)")
-    print("━" * w)
+    bar = "=" * w
+    print(f"\n{bar}")
+    print(f"  Watch Listings -- {date.today():%B %d, %Y}")
+    print(f"  {len(listings)} total  ({len(fpj)} FP Journe / {len(db)} De Bethune)")
+    print(bar)
 
     for brand_name, brand_listings in [("F.P. Journe", fpj), ("De Bethune", db)]:
         if not brand_listings:
             continue
         print(f"\n  {brand_name} ({len(brand_listings)})")
-        print("  " + "─" * (w - 2))
+        print("  " + "-" * (w - 2))
         for l in brand_listings:
             title = l.title if len(l.title) <= 44 else l.title[:41] + "…"
             print(f"  {title:<44}  {l.price.ljust(12)}  {l.source[:18]}")
@@ -1476,7 +1584,7 @@ def print_console_summary(
 
     if auction_lots:
         print(f"  Phillips Upcoming ({len(auction_lots)} lot(s))")
-        print("  " + "─" * (w - 2))
+        print("  " + "-" * (w - 2))
         for lot in auction_lots:
             title = lot.title if len(lot.title) <= 44 else lot.title[:41] + "…"
             print(f"  {title:<44}  {lot.estimate[:12].ljust(12)}  {lot.sale_date}")
@@ -1485,9 +1593,9 @@ def print_console_summary(
     print("  Source breakdown:")
     for s in stats:
         status = f"{s['count']} listings" if s["count"] > 0 else "0 listings"
-        err    = f"  ⚠ {s['error']}" if s["error"] else ""
+        err    = f"  ! {s['error']}" if s["error"] else ""
         print(f"    {s['source']:<28}  {status}{err}")
-    print("━" * w + "\n")
+    print(bar + "\n")
 
 
 # ── Email ──────────────────────────────────────────────────────────────────────
