@@ -138,144 +138,86 @@ def best_img(tag) -> str:
 # ── Chrono24 ───────────────────────────────────────────────────────────────────
 def scrape_chrono24(session: requests.Session) -> list[Listing]:
     """
-    Chrono24 uses Cloudflare bot protection — requests-based approaches get
-    a 403 before any HTML is served. Playwright + playwright-stealth runs a real
-    browser JS engine and patches all webdriver detection signals.
+    Chrono24 uses Cloudflare bot protection — GitHub Actions datacenter IPs are
+    blocked at IP-reputation level regardless of browser stealth.
 
-    Search URL: /search/index.htm?dosearch=true&query={brand}&sortorder=5&pageSize=120
-    Listing card selector: .js-listing-item-link (120 per page)
-    Card container:        .wt-search-result / .listing-item
+    Only De Bethune is scraped (~100 listings, mostly real held inventory).
+    FP Journe is intentionally excluded — ~900 listings of which ~70% are broker
+    placeholders with no held stock (per internal intel).
+
+    Routing through a Bright Data Web Unlocker residential proxy bypasses
+    Cloudflare. The static HTML served through the proxy already contains all
+    listing cards, so no Playwright is needed — plain requests + BeautifulSoup.
+    Credentials read from BRIGHT_DATA_PROXY env var.
+
+    URL:      /debethune/index.htm (brand page, up to 120 listings)
+    Selector: .js-listing-item-link
     """
+    proxy_url = os.environ.get("BRIGHT_DATA_PROXY", "")
+    if not proxy_url:
+        raise RuntimeError("BRIGHT_DATA_PROXY not set — skipping Chrono24")
+
+    proxies = {"http": proxy_url, "https": proxy_url}
+    BASE = "https://www.chrono24.com"
+    url = f"{BASE}/debethune/index.htm"
+
     try:
-        from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
-        from playwright_stealth import Stealth
-    except ImportError as e:
-        log.warning("Chrono24: missing dependency (%s) — skipping", e)
-        return []
+        resp = session.get(url, proxies=proxies, verify=False, timeout=30)
+        resp.raise_for_status()
+    except Exception as exc:
+        raise RuntimeError(f"Chrono24 request failed: {exc}") from exc
+
+    soup = BeautifulSoup(resp.text, "lxml")
+    cards = soup.select(".js-listing-item-link")
+    log.info("Chrono24 De Bethune: %d listing cards", len(cards))
+
+    if not cards:
+        # Check if we hit a challenge page
+        title = soup.title.string if soup.title else ""
+        if "moment" in title.lower() or "cloudflare" in title.lower():
+            raise RuntimeError(f"Blocked by Cloudflare ({title!r})")
+        raise RuntimeError("No listing cards found — page structure may have changed")
 
     listings: list[Listing] = []
-    queries = [
-        ("FP Journe",  "F.P. Journe"),
-        ("De Bethune", "De Bethune"),
-    ]
-    pw_stealth = Stealth()
+    for a in cards:
+        href = a.get("href", "")
+        if not href:
+            continue
+        listing_url = href if href.startswith("http") else BASE + href
 
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
+        card = a.find_parent(class_=re.compile(r"wt-search-result|listing-item|js-listing-item")) or a
+        img_tag = card.find("img")
+        img_url = best_img(img_tag)
+        img_url = img_url.replace("-Square28.", "-Square40.") if img_url else ""
+
+        texts = [el.get_text(" ", strip=True) for el in card.find_all(string=True, recursive=True)
+                 if el.get_text(strip=True)]
+        texts = [t for t in texts if len(t) > 1]
+
+        title = "Unknown"
+        for i, t in enumerate(texts):
+            if detect_brand(t):
+                parts = [t]
+                if i + 1 < len(texts):
+                    nxt = texts[i + 1]
+                    if "$" not in nxt and "price" not in nxt.lower() and len(nxt) > 3:
+                        parts.append(nxt)
+                title = " ".join(parts)
+                break
+
+        price = next(
+            (t for t in texts if "$" in t and any(c.isdigit() for c in t)),
+            next((t for t in texts if "price on request" in t.lower()), "—"),
         )
 
-        for brand, query in queries:
-            ctx = browser.new_context(
-                user_agent=HEADERS["User-Agent"],
-                viewport={"width": 1440, "height": 900},
-                locale="en-US",
-            )
-            page = ctx.new_page()
-            pw_stealth.apply_stealth_sync(page)
-
-            url = (
-                "https://www.chrono24.com/search/index.htm"
-                f"?dosearch=true&query={quote_plus(query)}&sortorder=5&pageSize=120"
-            )
-            try:
-                # domcontentloaded is reliable in CI — networkidle can hang
-                # indefinitely when the page fires continuous background requests
-                # (analytics, Algolia keep-alive). We give JS 6 s to render
-                # the listing cards, then wait explicitly for the selector.
-                page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-                page.wait_for_timeout(6_000)
-
-                try:
-                    page.wait_for_selector(".js-listing-item-link", timeout=45_000)
-                except PwTimeout:
-                    title = page.title()
-                    log.warning(
-                        "Chrono24 %s: listing selector not found — page title: %r",
-                        brand, title,
-                    )
-                    ctx.close()
-                    # Cloudflare challenge = definitive block, not empty results
-                    if "moment" in title.lower() or "cloudflare" in title.lower() or "just a" in title.lower():
-                        raise RuntimeError(f"Blocked by Cloudflare ({title!r})")
-                    continue
-
-                items = page.evaluate("""() => {
-                    const seen = new Set();
-                    const out = [];
-                    document.querySelectorAll(".js-listing-item-link").forEach(a => {
-                        const href = a.href;
-                        if (!href || seen.has(href)) return;
-                        seen.add(href);
-                        const card = a.closest(
-                            ".wt-search-result, .listing-item, .js-listing-item"
-                        ) || a;
-                        const img = card.querySelector(
-                            ".watch-image img, .listing-item-image img, img"
-                        );
-                        const texts = Array.from(card.querySelectorAll("*"))
-                            .filter(el => el.children.length === 0)
-                            .map(el => el.textContent.trim())
-                            .filter(t => t.length > 1);
-                        out.push({
-                            url:    href,
-                            imgSrc: img ? (img.src || img.dataset.src || "") : "",
-                            texts:  texts,
-                        });
-                    });
-                    return out;
-                }""")
-
-                log.info("Chrono24 %s: %d listings", brand, len(items))
-
-                for item in items:
-                    texts = item.get("texts", [])
-
-                    # Title: find the text that contains the brand name, then
-                    # append the next text (model name) if it isn't a price.
-                    title = "Unknown"
-                    for i, t in enumerate(texts):
-                        if detect_brand(t):
-                            parts = [t]
-                            if i + 1 < len(texts):
-                                nxt = texts[i + 1]
-                                if "$" not in nxt and "price" not in nxt.lower() and len(nxt) > 3:
-                                    parts.append(nxt)
-                            title = " ".join(parts)
-                            break
-
-                    price = next(
-                        (t for t in texts if "$" in t and any(c.isdigit() for c in t)),
-                        next((t for t in texts if "price on request" in t.lower()), "—"),
-                    )
-
-                    img_url = item.get("imgSrc", "")
-                    # Upgrade to a larger thumbnail for the email digest
-                    img_url = img_url.replace("-Square28.", "-Square40.") if img_url else ""
-
-                    listings.append(Listing(
-                        title=title,
-                        price=price,
-                        image_url=img_url,
-                        listing_url=item.get("url", ""),
-                        source="Chrono24",
-                        brand=brand,
-                    ))
-
-            except PwTimeout:
-                log.warning("Chrono24 timed out for %s", brand)
-            except Exception as exc:
-                log.error("Chrono24 %s failed: %s", brand, exc)
-            finally:
-                ctx.close()
-            time.sleep(2)
-
-        browser.close()
+        listings.append(Listing(
+            title=title,
+            price=price,
+            image_url=img_url,
+            listing_url=listing_url,
+            source="Chrono24",
+            brand="De Bethune",
+        ))
 
     return deduplicate(listings)
 

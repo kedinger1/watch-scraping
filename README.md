@@ -21,7 +21,7 @@ Built and maintained by [The 1916 Company](https://www.1916company.com).
 
 | Source | Method |
 |---|---|
-| **Chrono24** | ~~Playwright + stealth~~ — intentionally excluded (see note below) |
+| **Chrono24** | Playwright + Bright Data residential proxy — De Bethune only (see note below) |
 | **eBay** | eBay Browse API (OAuth) |
 | **A Collected Man** | Shopify `/products.json` |
 | **Wrist Aficionado** | Shopify `/products.json` |

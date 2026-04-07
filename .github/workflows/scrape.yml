@@ -35,4 +35,5 @@ jobs:
           EBAY_CLIENT_SECRET: ${{ secrets.EBAY_CLIENT_SECRET }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          BRIGHT_DATA_PROXY: ${{ secrets.BRIGHT_DATA_PROXY }}
         run: python scraper.py
