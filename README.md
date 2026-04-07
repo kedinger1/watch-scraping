@@ -21,7 +21,7 @@ Built and maintained by [The 1916 Company](https://www.1916company.com).
 
 | Source | Method |
 |---|---|
-| **Chrono24** | Playwright + stealth (Cloudflare bypass) |
+| **Chrono24** | ~~Playwright + stealth~~ — intentionally excluded (see note below) |
 | **eBay** | eBay Browse API (OAuth) |
 | **A Collected Man** | Shopify `/products.json` |
 | **Wrist Aficionado** | Shopify `/products.json` |
@@ -35,6 +35,8 @@ Built and maintained by [The 1916 Company](https://www.1916company.com).
 | **1stDibs** | HTML scraping (BeautifulSoup) |
 | **Watches of Switzerland** | HTML scraping (BeautifulSoup) |
 | **Phillips** *(auctions)* | React hydration JSON extraction |
+
+> **Note on Chrono24:** Chrono24 surfaces ~900 FP Journe and ~96 De Bethune listings, but per internal intel approximately 70% are broker placeholder listings — the watch is not held inventory; the dealer will source it through their network if they get a hit. Including Chrono24 would flood the digest with noise and undermine the signal from sources where the watch actually exists. It remains in the codebase but is intentionally not connected.
 
 ---
 
