@@ -1720,15 +1720,16 @@ def stats_table_html(stats: list[dict], brand: str) -> str:
     rows = []
     for s in stats:
         n = s.get(brand_key, s.get("count", 0))
-        color = "#2a6b2a" if n > 0 else "#bbb"
-        err = (
-            f' <span style="color:#b94040;font-size:11px;">({escape(str(s["error"]))})</span>'
-            if s["error"] else ""
-        )
+        if s["error"]:
+            value_cell = '<span style="color:#b94040;font-weight:600;">failed</span>'
+        elif n > 0:
+            value_cell = f'<span style="color:#2a6b2a;font-weight:600;">{n}</span>'
+        else:
+            value_cell = '<span style="color:#bbb;">0</span>'
         rows.append(
             f'<tr>'
             f'<td style="padding:5px 8px;">{escape(s["source"])}</td>'
-            f'<td style="padding:5px 8px;font-weight:600;color:{color};">{n}{err}</td>'
+            f'<td style="padding:5px 8px;">{value_cell}</td>'
             f'</tr>'
         )
     return (
