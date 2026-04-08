@@ -81,13 +81,20 @@ class Listing:
 
 @dataclass
 class AuctionLot:
-    title: str          # "F.P. Journe Centigraphe Souverain"
-    estimate: str       # "$80,000 – $160,000"
-    sale_date: str      # "April 8, 2026"
-    sale_location: str  # "New York" | "Geneva" | "Hong Kong"
+    title: str                      # "F.P. Journe Centigraphe Souverain"
+    estimate: str                   # "$80,000 – $160,000" (formatted for display)
+    sale_date: str                  # "April 8, 2026"
+    sale_location: str              # "New York" | "Geneva" | "Online"
     image_url: str
     lot_url: str
-    brand: str          # "FP Journe" | "De Bethune"
+    brand: str                      # "FP Journe" | "De Bethune"
+    auction_house: str = "Phillips"
+    sale_name: str = ""             # "Important Watches, New York"
+    lot_number: str = ""
+    estimate_low: Optional[float] = None
+    estimate_high: Optional[float] = None
+    currency: str = "USD"
+    is_upcoming: bool = True
 
 
 def detect_brand(text: str) -> Optional[str]:
@@ -1203,10 +1210,17 @@ def scrape_phillips(session: requests.Session) -> list[AuctionLot]:
             else:
                 img_url = img_path
 
+            low_f  = float(low)  if low  else None
+            high_f = float(high) if high else None
             lots.append(AuctionLot(
                 title=title, estimate=estimate,
                 sale_date=sale_date, sale_location=location,
                 image_url=img_url, lot_url=lot_url, brand=brand,
+                auction_house="Phillips",
+                sale_name=f"Phillips {location}",
+                lot_number=str(lot.get("lotNumber", "")),
+                estimate_low=low_f, estimate_high=high_f,
+                currency=lot.get("currencySign", "$").replace("$", "USD"),
             ))
 
         time.sleep(1)
@@ -1371,6 +1385,251 @@ def save_to_supabase(listings: list[Listing]) -> None:
     )
 
 
+def save_auction_lots_to_supabase(lots: list[AuctionLot]) -> None:
+    """
+    Upsert auction lots to the auction_lots table and mark any
+    previously-upcoming lots not seen this run as inactive (is_upcoming=false).
+    """
+    url_env = os.environ.get("SUPABASE_URL", "")
+    key_env = os.environ.get("SUPABASE_KEY", "")
+    if not url_env or not key_env:
+        log.warning("SUPABASE_URL / SUPABASE_KEY not set — skipping auction DB save")
+        return
+
+    try:
+        from supabase import create_client
+    except ImportError:
+        log.warning("supabase package not installed — skipping auction DB save")
+        return
+
+    try:
+        sb = create_client(url_env, key_env)
+    except Exception as exc:
+        log.error("Supabase client init failed (auction_lots): %s", exc)
+        return
+
+    from datetime import datetime, timezone
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # Fetch existing upcoming lots so we can mark stale ones inactive
+    try:
+        existing_resp = (
+            sb.table("auction_lots")
+            .select("lot_url, is_upcoming")
+            .eq("is_upcoming", True)
+            .execute()
+        )
+        existing_upcoming: set[str] = {
+            row["lot_url"] for row in (existing_resp.data or [])
+        }
+    except Exception as exc:
+        log.error("Supabase fetch existing auction_lots failed: %s", exc)
+        existing_upcoming = set()
+
+    seen_urls: set[str] = set()
+
+    for lot in lots:
+        seen_urls.add(lot.lot_url)
+
+        # Convert human-readable sale_date to ISO date for the DATE column
+        sale_date_iso = None
+        if lot.sale_date and lot.sale_date not in ("TBA", "—"):
+            for fmt in ("%b %d, %Y", "%B %d, %Y"):
+                try:
+                    from datetime import datetime as _dt
+                    sale_date_iso = _dt.strptime(lot.sale_date, fmt).date().isoformat()
+                    break
+                except ValueError:
+                    continue
+
+        row = {
+            "lot_url":       lot.lot_url,
+            "auction_house": lot.auction_house,
+            "brand":         lot.brand,
+            "title":         lot.title,
+            "lot_number":    lot.lot_number or None,
+            "sale_name":     lot.sale_name or None,
+            "estimate_low":  lot.estimate_low,
+            "estimate_high": lot.estimate_high,
+            "currency":      lot.currency,
+            "sale_date":     sale_date_iso,
+            "location":      lot.sale_location,
+            "image_url":     lot.image_url or None,
+            "is_upcoming":   True,
+            "last_seen_at":  now_iso,
+        }
+
+        try:
+            sb.table("auction_lots").upsert(row, on_conflict="lot_url").execute()
+        except Exception as exc:
+            log.warning("Supabase upsert auction lot failed for %s: %s",
+                        lot.lot_url[:60], exc)
+
+    # Mark lots that disappeared from the live feed as no longer upcoming
+    stale = [u for u in existing_upcoming if u not in seen_urls]
+    if stale:
+        try:
+            (
+                sb.table("auction_lots")
+                .update({"is_upcoming": False})
+                .in_("lot_url", stale)
+                .execute()
+            )
+            log.info("Supabase: marked %d auction lot(s) inactive", len(stale))
+        except Exception as exc:
+            log.warning("Supabase mark-inactive auction_lots failed: %s", exc)
+
+    log.info(
+        "Supabase auction_lots: upserted %d lot(s), %d marked inactive",
+        len(seen_urls), len(stale),
+    )
+
+
+# ── Sotheby's ──────────────────────────────────────────────────────────────────
+def scrape_sothebys(session: requests.Session) -> list[AuctionLot]:
+    """
+    Sotheby's auction lot scraper.
+
+    Sotheby's mixes auction lots and fixed-price marketplace items in the same
+    Algolia index (prod_product_items).  The correct way to isolate auction lots
+    is to filter by waysToBuy=bid (as opposed to buyNow / private).
+
+    Creator pages (SSR) expose all of this via __NEXT_DATA__:
+      /en/buy/luxury/watches/watch/f-p-journe
+      /en/buy/luxury/watches/watch/de-bethune
+
+    NOTE: Sotheby's typically lists FP Journe and De Bethune auction lots only
+    in the lead-up to their dedicated watch sale events (2–3× per year).
+    The scraper correctly returns 0 when no lots are in market.
+    """
+    BASE = "https://www.sothebys.com"
+    # (brand_label, creator_slug_or_None, search_query)
+    # FP Journe has a dedicated creator page; De Bethune uses the search endpoint.
+    queries = [
+        ("FP Journe",  "f-p-journe",  "f.p. journe"),
+        ("De Bethune", None,           "de bethune"),
+    ]
+    lots: list[AuctionLot] = []
+
+    for brand, creator_slug, search_q in queries:
+        # Try the creator collection page first (faster, SSR-cached)
+        hits: list[dict] = []
+        if creator_slug:
+            url = f"{BASE}/en/buy/luxury/watches/watch/{creator_slug}?waysToBuy=bid"
+            resp = fetch(url, session)
+            if resp and resp.status_code == 200:
+                m = re.search(
+                    r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>',
+                    resp.text, re.DOTALL,
+                )
+                if m:
+                    try:
+                        nd  = json.loads(m.group(1))
+                        pp  = nd.get("props", {}).get("pageProps", {})
+                        rs  = pp.get("resultsState", {})
+                        hits = rs.get("rawResults", [{}])[0].get("hits", [])
+                    except Exception as exc:
+                        log.warning("Sotheby's %s creator-page JSON error: %s", brand, exc)
+
+        # Fall back to search endpoint if creator page unavailable / returned nothing
+        if not hits and search_q:
+            url = f"{BASE}/en/search?query={quote_plus(search_q)}"
+            resp = fetch(url, session)
+            if resp:
+                m = re.search(
+                    r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>',
+                    resp.text, re.DOTALL,
+                )
+                if m:
+                    try:
+                        nd  = json.loads(m.group(1))
+                        pp  = nd.get("props", {}).get("pageProps", {})
+                        hits = pp.get("results", {}).get("hits", [])
+                    except Exception as exc:
+                        log.warning("Sotheby's %s search-page JSON error: %s", brand, exc)
+
+        log.info("Sotheby's %s: %d candidate hit(s)", brand, len(hits))
+
+        for h in hits:
+            # Reject marketplace / private-sale items via any available signal:
+            #   waysToBuy (creator page) or type/salesChannel (search page)
+            if (
+                h.get("waysToBuy") == "buyNow"
+                or h.get("type") == "Buy Now"
+                or h.get("salesChannel") == "retail"
+            ):
+                continue
+
+            # Sotheby's auction lots should have a distinct low/high estimate
+            # (not equal to listPrice, which is a fixed retail price)
+            low        = h.get("lowEstimate")  or 0
+            high       = h.get("highEstimate") or 0
+            list_price = h.get("listPrice")    or 0
+
+            # Marketplace sentinel: low == high == listPrice (all nonzero)  →  skip
+            if low and high and low == high == list_price:
+                continue
+
+            title    = h.get("title") or "Unknown"
+            currency = h.get("currency", "USD")
+            sign     = "$" if currency == "USD" else currency
+
+            if low and high and low != high:
+                estimate = f"{sign}{int(low):,} – {sign}{int(high):,}"
+            elif low or high:
+                estimate = f"{sign}{int(low or high):,}"
+            else:
+                estimate = "TBA"
+
+            # Lot URL
+            lot_path = h.get("url", "") or h.get("slug", "")
+            if lot_path.startswith("http"):
+                lot_url = lot_path
+            elif lot_path:
+                lot_url = f"{BASE}/en/{lot_path.lstrip('/')}"
+            else:
+                lot_url = url   # fallback to the search page
+
+            # Sale date — prefer lot-level date fields over publishDate
+            from datetime import datetime, timezone
+            sale_date = "TBA"
+            for ts_field in ("saleDate", "auctionDate", "startDate", "publishDate"):
+                ts = h.get(ts_field) or 0
+                if ts:
+                    try:
+                        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+                        sale_date = f"{dt.strftime('%b')} {dt.day}, {dt.year}"
+                    except Exception:
+                        pass
+                    break
+
+            location  = h.get("saleLocation") or h.get("location") or "Sotheby's"
+            sale_name = h.get("saleName") or h.get("sale_name") or "Sotheby's Watch Sale"
+            lot_number = str(h.get("lotNumber") or h.get("lot_number") or "")
+            image_url  = h.get("imageUrl") or h.get("image_url") or ""
+
+            lots.append(AuctionLot(
+                title=title,
+                estimate=estimate,
+                sale_date=sale_date,
+                sale_location=location,
+                image_url=image_url,
+                lot_url=lot_url,
+                brand=brand,
+                auction_house="Sotheby's",
+                sale_name=sale_name,
+                lot_number=lot_number,
+                estimate_low=float(low) if low else None,
+                estimate_high=float(high) if high else None,
+                currency=currency,
+            ))
+
+        time.sleep(1)
+
+    log.info("Sotheby's total: %d lot(s)", len(lots))
+    return lots
+
+
 # ── Deduplication ──────────────────────────────────────────────────────────────
 def deduplicate(listings: list[Listing]) -> list[Listing]:
     seen: set[str] = set()
@@ -1463,8 +1722,14 @@ def gather_all(
     auction_lots: list[AuctionLot] = []
     stats: list[dict] = []
 
+    def _matches(name: str, query: str) -> bool:
+        """Case-insensitive substring match, ignoring punctuation."""
+        q = re.sub(r"[^\w]", "", query.lower())
+        n = re.sub(r"[^\w]", "", name.lower())
+        return q in n
+
     for name, scraper_fn in SCRAPERS:
-        if only_source and only_source.lower() not in name.lower():
+        if only_source and not _matches(name, only_source):
             continue
         log.info("── Scraping %s …", name)
         try:
@@ -1483,14 +1748,21 @@ def gather_all(
             log.error("Scraper %s crashed: %s", name, exc)
             stats.append({"source": name, "count": 0, "fpj": 0, "db": 0, "error": str(exc)})
 
-    # Phillips runs separately — returns AuctionLot, not Listing
-    if not only_source or "phillips" in (only_source or "").lower():
-        log.info("── Scraping Phillips …")
+    # Auction house scrapers — return AuctionLot, not Listing
+    auction_scrapers = [
+        ("Phillips",    scrape_phillips),
+        ("Sotheby's",   scrape_sothebys),
+    ]
+    for auction_name, auction_fn in auction_scrapers:
+        label = f"{auction_name} (upcoming)"
+        if only_source and not _matches(auction_name, only_source):
+            continue
+        log.info("── Scraping %s …", auction_name)
         try:
-            lots = scrape_phillips(session)
+            lots = auction_fn(session)
             auction_lots.extend(lots)
             stats.append({
-                "source": "Phillips (upcoming)",
+                "source": label,
                 "count":  len(lots),
                 "fpj":    sum(1 for l in lots if l.brand == "FP Journe"),
                 "db":     sum(1 for l in lots if l.brand == "De Bethune"),
@@ -1498,8 +1770,8 @@ def gather_all(
             })
             log.info("   → %d upcoming lot(s)", len(lots))
         except Exception as exc:
-            log.error("Phillips scraper crashed: %s", exc)
-            stats.append({"source": "Phillips (upcoming)", "count": 0, "fpj": 0, "db": 0, "error": str(exc)})
+            log.error("%s scraper crashed: %s", auction_name, exc)
+            stats.append({"source": label, "count": 0, "fpj": 0, "db": 0, "error": str(exc)})
 
     all_listings = cross_platform_dedup(all_listings)
     return all_listings, auction_lots, stats
@@ -1529,11 +1801,12 @@ def print_console_summary(
         print()
 
     if auction_lots:
-        print(f"  Phillips Upcoming ({len(auction_lots)} lot(s))")
+        print(f"  Upcoming at Auction ({len(auction_lots)} lot(s))")
         print("  " + "-" * (w - 2))
         for lot in auction_lots:
-            title = lot.title if len(lot.title) <= 44 else lot.title[:41] + "…"
-            print(f"  {title:<44}  {lot.estimate[:12].ljust(12)}  {lot.sale_date}")
+            title = lot.title if len(lot.title) <= 40 else lot.title[:37] + "…"
+            house = lot.auction_house[:10]
+            print(f"  {title:<40}  {lot.estimate[:12].ljust(12)}  {house:<10}  {lot.sale_date}")
         print()
 
     print("  Source breakdown:")
@@ -1626,20 +1899,31 @@ def auction_table_html(lots: list[AuctionLot]) -> str:
             f'onerror="this.parentElement.innerHTML=\'&nbsp;\'" /></a>'
             if lot.image_url else "&nbsp;"
         )
+        lot_num_html = (
+            f'<br><span style="color:#bbb;font-size:10px;">Lot {escape(lot.lot_number)}</span>'
+            if lot.lot_number else ""
+        )
+        sale_name_html = (
+            f'<span style="color:#888;font-size:11px;">{escape(lot.sale_name)}</span><br>'
+            if lot.sale_name else ""
+        )
         rows.append(
             f'<tr style="border-bottom:1px solid #e8e4f0;">'
             f'<td style="padding:10px 8px;width:96px;vertical-align:middle;">{img_cell}</td>'
             f'<td style="padding:10px 8px;vertical-align:middle;">'
             f'  <a href="{escape(lot.lot_url)}" '
             f'     style="color:#3a1a55;font-weight:600;text-decoration:none;font-size:14px;">'
-            f'     {escape(lot.title)}</a>'
+            f'     {escape(lot.title)}</a>{lot_num_html}'
             f'</td>'
             f'<td style="padding:10px 8px;vertical-align:middle;white-space:nowrap;'
             f'font-weight:700;color:#5a3a80;font-size:14px;">{escape(lot.estimate)}</td>'
             f'<td style="padding:10px 8px;vertical-align:middle;font-size:12px;color:#777;">'
+            f'  {sale_name_html}'
             f'  {escape(lot.sale_date)}<br>'
             f'  <span style="color:#aaa;">{escape(lot.sale_location)}</span>'
             f'</td>'
+            f'<td style="padding:10px 8px;vertical-align:middle;font-size:12px;'
+            f'color:#777;white-space:nowrap;">{escape(lot.auction_house)}</td>'
             f'</tr>'
         )
     return (
@@ -1654,7 +1938,9 @@ def auction_table_html(lots: list[AuctionLot]) -> str:
         '<th style="padding:9px 8px;text-align:left;font-size:11px;color:#999;'
         'font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Estimate</th>'
         '<th style="padding:9px 8px;text-align:left;font-size:11px;color:#999;'
-        'font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Sale Date</th>'
+        'font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Sale</th>'
+        '<th style="padding:9px 8px;text-align:left;font-size:11px;color:#999;'
+        'font-weight:600;text-transform:uppercase;letter-spacing:.5px;">House</th>'
         '</tr></thead>'
         '<tbody>' + "".join(rows) + "</tbody></table>"
     )
@@ -1729,10 +2015,10 @@ def build_email(
         lines.append(f"  {l.price} | {l.source}{also}{found}")
         lines.append(f"  {l.listing_url}\n")
     if b_lots:
-        lines.append(f"── Phillips Upcoming ({n_lots}) ──")
+        lines.append(f"── Upcoming at Auction ({n_lots}) ──")
         for lot in b_lots:
             lines.append(f"  {lot.title}")
-            lines.append(f"  Est. {lot.estimate} | {lot.sale_date} · {lot.sale_location}")
+            lines.append(f"  Est. {lot.estimate} | {lot.auction_house} · {lot.sale_date} · {lot.sale_location}")
             lines.append(f"  {lot.lot_url}\n")
     plain = "\n".join(lines)
 
@@ -1740,19 +2026,27 @@ def build_email(
     count_str  = f"{n_list} listing{'s' if n_list != 1 else ''}"
     lots_str   = (
         f' &nbsp;+&nbsp; <span style="color:#3a1a55;">'
-        f'{n_lots} Phillips lot{"s" if n_lots != 1 else ""}</span>'
+        f'{n_lots} auction lot{"s" if n_lots != 1 else ""}</span>'
         if n_lots else ""
     )
 
     auction_html = ""
     if b_lots:
+        # Group lots by auction house for the sub-header list
+        houses = []
+        seen_h: set[str] = set()
+        for _l in b_lots:
+            if _l.auction_house not in seen_h:
+                seen_h.add(_l.auction_house)
+                houses.append(_l.auction_house)
+        houses_str = " · ".join(houses)
         auction_html = (
             f'<div style="margin-top:40px;">'
             f'<h3 style="margin:0 0 10px;color:#3a1a55;font-size:18px;'
             f'border-bottom:2px solid #d8d0e8;padding-bottom:6px;">'
-            f'Upcoming at Auction — Phillips '
+            f'Upcoming at Auction '
             f'<span style="font-size:13px;font-weight:normal;color:#aaa;">'
-            f'{n_lots} lot{"s" if n_lots != 1 else ""}</span></h3>'
+            f'{n_lots} lot{"s" if n_lots != 1 else ""} &mdash; {escape(houses_str)}</span></h3>'
             + auction_table_html(b_lots)
             + '</div>'
         )
@@ -1867,6 +2161,8 @@ if __name__ == "__main__":
         print("Available sources (use any substring with --source):")
         for name, _ in SCRAPERS:
             print(f"  {name}")
+        print("  Phillips   (auction lots)")
+        print("  Sotheby's  (auction lots)")
         sys.exit(0)
 
     # --source alone implies no email (dev / debug mode)
@@ -1883,12 +2179,13 @@ if __name__ == "__main__":
 
     fpj_count = sum(1 for l in listings if l.brand == "FP Journe")
     db_count  = sum(1 for l in listings if l.brand == "De Bethune")
-    log.info("Total: %d listings (%d FPJ, %d DB) + %d Phillips lot(s)",
+    log.info("Total: %d listings (%d FPJ, %d DB) + %d auction lot(s)",
              len(listings), fpj_count, db_count, len(auction_lots))
 
     # Persist to Supabase (only when running a full scrape or in CI)
     if not args.source:
         save_to_supabase(listings)
+        save_auction_lots_to_supabase(auction_lots)
 
     if skip_email:
         print_console_summary(listings, auction_lots, stats)
