@@ -37,6 +37,7 @@ Built and maintained by [The 1916 Company](https://www.1916company.com).
 | **Phillips** *(auctions)* | React hydration JSON extraction |
 | **Sotheby's** *(auctions)* | Algolia index JSON |
 | **Christie's** *(auctions)* | Playwright + Bright Data proxy + `__NEXT_DATA__` fallback |
+| **Barnebys** *(auctions)* | `__redux` embedded JSON (React/Algolia search) |
 
 > **Note on Chrono24:** Chrono24 surfaces ~900 FP Journe and ~96 De Bethune listings, but per internal intel approximately 70% are broker placeholder listings — the watch is not held inventory; the dealer will source it through their network if they get a hit. Including Chrono24 would flood the digest with noise and undermine the signal from sources where the watch actually exists. It remains in the codebase but is intentionally not connected.
 
@@ -48,7 +49,7 @@ Sources ranked by implementation priority. Phillips, Sotheby's, and Christie's a
 
 | Priority | Source | Coverage | Approach |
 |---|---|---|---|
-| 1 | **Barnebys** | Europe-wide aggregator — De Bethune's home market | XML feed via developer.barnebys.com |
+| 1 | ~~**Barnebys**~~ | ✅ Live — Europe-wide aggregator | `__redux` embedded JSON |
 | 2 | **LiveAuctioneers** | US aggregator, hundreds of small houses | XHR JSON (React SPA) — confirmed FPJ/DB lots |
 | 3 | **Invaluable** | Broadest small-house coverage globally | Reverse-engineer search XHR — no public API |
 | 4 | **Antiquorum** | Watch specialist — different buyer pool, pricing signal | XHR on catalog.antiquorum.swiss |

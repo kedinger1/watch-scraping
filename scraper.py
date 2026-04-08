@@ -1884,6 +1884,129 @@ def scrape_christies(session: requests.Session) -> list[AuctionLot]:
     return lots
 
 
+# ── Barnebys ───────────────────────────────────────────────────────────────────
+def scrape_barnebys(session: requests.Session) -> list[AuctionLot]:
+    """
+    Barnebys auction aggregator — upcoming lots only.
+
+    Barnebys embeds search results in a Redux state object on their search page:
+      window.__redux.search.resultState.rawResults[0].hits[]
+
+    Each hit contains: uid, ah (auction house), url, img, i18n (title),
+    ts.ends (Unix timestamp), priceE (estimate range), loc (location).
+
+    We search /auctions/search?q=<brand> which returns only active/upcoming lots
+    (as opposed to /realized-prices/search which returns sold lots).
+    """
+    BASE = "https://www.barnebys.com"
+    queries = [
+        ("FP Journe",  "fp journe"),
+        ("De Bethune", "de bethune"),
+    ]
+    lots: list[AuctionLot] = []
+    seen_urls: set[str] = set()
+
+    for brand, query in queries:
+        url = f"{BASE}/auctions/search?q={quote_plus(query)}"
+        resp = fetch(url, session)
+        if not resp:
+            log.warning("Barnebys %s: no response", brand)
+            continue
+
+        # Extract __redux JSON from script tag
+        m = re.search(r'window\.__redux\s*=\s*(\{.*?\});\s*</script>', resp.text, re.DOTALL)
+        if not m:
+            log.warning("Barnebys %s: __redux not found", brand)
+            continue
+
+        try:
+            redux = json.loads(m.group(1))
+        except json.JSONDecodeError as exc:
+            log.warning("Barnebys %s: JSON parse error: %s", brand, exc)
+            continue
+
+        raw_results = (
+            redux.get("search", {})
+                 .get("resultState", {})
+                 .get("rawResults", [{}])
+        )
+        hits = raw_results[0].get("hits", []) if raw_results else []
+        log.info("Barnebys %s: %d hit(s)", brand, len(hits))
+
+        from datetime import datetime, timezone
+        for h in hits:
+            lot_url = h.get("url", "")
+            if not lot_url:
+                continue
+            if not lot_url.startswith("http"):
+                lot_url = BASE + lot_url
+            if lot_url in seen_urls:
+                continue
+            seen_urls.add(lot_url)
+
+            # Title from i18n — prefer English, fall back to first available
+            i18n = h.get("i18n") or {}
+            title = (
+                i18n.get("en", {}).get("title")
+                or next((v.get("title") for v in i18n.values() if isinstance(v, dict) and v.get("title")), None)
+                or "Unknown"
+            )
+
+            # Image
+            img = h.get("img") or ""
+            if img and not img.startswith("http"):
+                img = "https:" + img
+
+            # Estimate — priceE is a dict like {"USD": [low, high], "EUR": [...]}
+            price_e = h.get("priceE") or {}
+            estimate = "—"
+            for currency in ("USD", "EUR", "GBP", "SEK", "CHF"):
+                rng = price_e.get(currency)
+                if rng and len(rng) >= 2 and rng[0] and rng[1]:
+                    sign = {"USD": "$", "EUR": "€", "GBP": "£", "SEK": "SEK ", "CHF": "CHF "}.get(currency, currency + " ")
+                    estimate = f"{sign}{int(rng[0]):,} – {sign}{int(rng[1]):,}"
+                    break
+
+            # Sale date from ts.ends (Unix timestamp)
+            ts = h.get("ts") or {}
+            ends_ts = ts.get("ends") or 0
+            sale_date = "—"
+            if ends_ts:
+                try:
+                    dt = datetime.fromtimestamp(ends_ts, tz=timezone.utc)
+                    sale_date = f"{dt.strftime('%b')} {dt.day}, {dt.year}"
+                except Exception:
+                    pass
+
+            # Location
+            loc = h.get("loc") or {}
+            location = loc.get("city") or loc.get("region") or loc.get("country") or "Barnebys"
+
+            # Auction house name
+            auction_house_name = h.get("ah") or "Barnebys"
+
+            lots.append(AuctionLot(
+                title=title,
+                estimate=estimate,
+                sale_date=sale_date,
+                sale_location=location,
+                image_url=img,
+                lot_url=lot_url,
+                brand=brand,
+                auction_house=auction_house_name,
+                sale_name=f"{auction_house_name}",
+                lot_number=str(h.get("uid") or ""),
+                estimate_low=float(price_e.get("USD", [0])[0]) if price_e.get("USD") else None,
+                estimate_high=float(price_e.get("USD", [0, 0])[1]) if price_e.get("USD") and len(price_e.get("USD", [])) >= 2 else None,
+                currency="USD",
+            ))
+
+        time.sleep(1)
+
+    log.info("Barnebys total: %d lot(s)", len(lots))
+    return lots
+
+
 # ── Deduplication ──────────────────────────────────────────────────────────────
 def deduplicate(listings: list[Listing]) -> list[Listing]:
     seen: set[str] = set()
@@ -2007,6 +2130,7 @@ def gather_all(
         ("Phillips",    scrape_phillips),
         ("Sotheby's",   scrape_sothebys),
         ("Christie's",  scrape_christies),
+        ("Barnebys",    scrape_barnebys),
     ]
     for auction_name, auction_fn in auction_scrapers:
         label = f"{auction_name} (upcoming)"
@@ -2539,7 +2663,7 @@ if __name__ == "__main__":
         session.headers.update(HEADERS)
         all_auction_lots: list[AuctionLot] = []
         all_stats: list[dict] = []
-        for house, fn in [("Phillips", scrape_phillips), ("Sotheby's", scrape_sothebys), ("Christie's", scrape_christies)]:
+        for house, fn in [("Phillips", scrape_phillips), ("Sotheby's", scrape_sothebys), ("Christie's", scrape_christies), ("Barnebys", scrape_barnebys)]:
             log.info("── Scraping %s (auction lots) …", house)
             try:
                 lots = fn(session)
