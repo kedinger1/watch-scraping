@@ -2544,7 +2544,7 @@ if __name__ == "__main__":
             try:
                 lots = fn(session)
                 all_auction_lots.extend(lots)
-                all_stats.append({"source": house, "count": len(lots), "status": "ok"})
+                all_stats.append({"source": house, "count": len(lots), "status": "ok", "error": None})
                 log.info("%s: %d lot(s)", house, len(lots))
             except Exception as exc:
                 log.error("%s scraper failed: %s", house, exc)

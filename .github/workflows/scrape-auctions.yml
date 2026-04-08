@@ -23,6 +23,9 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
+      - name: Install Playwright browser (Chromium for Christie's)
+        run: playwright install chromium --with-deps
+
       - name: Refresh auction lots (Phillips, Sotheby's, Christie's)
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
