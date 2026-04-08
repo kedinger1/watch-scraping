@@ -1488,6 +1488,66 @@ def save_auction_lots_to_supabase(lots: list[AuctionLot]) -> None:
 
 
 # ── Sotheby's ──────────────────────────────────────────────────────────────────
+def _sothebys_sale_dates(session: requests.Session, sale_slug: str, base: str) -> tuple[str, str | None]:
+    """
+    Fetch a Sotheby's sale page and return (sale_date_str, sale_date_end_iso).
+
+    Sale pages embed startDate (preview/open) and auctionDate (hammer/close)
+    in __NEXT_DATA__. lot-level hits on creator pages don't carry dates at all,
+    so we fetch the sale page once per unique sale slug and cache the result.
+
+    Returns ("TBA", None) if the page can't be fetched or parsed.
+    """
+    from datetime import datetime, timezone
+    url = f"{base}/en/buy/auction/{sale_slug.lstrip('/')}"
+    resp = fetch(url, session)
+    if not resp:
+        return "TBA", None
+    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', resp.text, re.DOTALL)
+    if not m:
+        return "TBA", None
+    try:
+        nd = json.loads(m.group(1))
+        pp = nd.get("props", {}).get("pageProps", {})
+
+        # Walk all keys looking for startDate / auctionDate at any nesting level
+        def _find(obj: object, keys: list[str]) -> dict[str, str]:
+            found: dict[str, str] = {}
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if k in keys and isinstance(v, str) and v:
+                        found[k] = v
+                    found.update(_find(v, keys))
+            elif isinstance(obj, list):
+                for item in obj:
+                    found.update(_find(item, keys))
+            return found
+
+        dates = _find(pp, ["startDate", "auctionDate"])
+        start_raw = dates.get("startDate", "")
+        close_raw = dates.get("auctionDate", "") or start_raw
+
+        def _fmt(iso: str) -> str:
+            try:
+                dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+                return f"{dt.strftime('%b')} {dt.day}, {dt.year}"
+            except Exception:
+                return ""
+
+        def _iso_date(iso: str) -> str | None:
+            try:
+                return datetime.fromisoformat(iso.replace("Z", "+00:00")).date().isoformat()
+            except Exception:
+                return None
+
+        sale_date = _fmt(start_raw) or _fmt(close_raw) or "TBA"
+        sale_date_end = _iso_date(close_raw) if close_raw != start_raw else None
+        return sale_date, sale_date_end
+    except Exception as exc:
+        log.warning("Sotheby's sale-page date parse error (%s): %s", sale_slug, exc)
+        return "TBA", None
+
+
 def scrape_sothebys(session: requests.Session) -> list[AuctionLot]:
     """
     Sotheby's auction lot scraper.
@@ -1500,21 +1560,23 @@ def scrape_sothebys(session: requests.Session) -> list[AuctionLot]:
       /en/buy/luxury/watches/watch/f-p-journe
       /en/buy/luxury/watches/watch/de-bethune
 
+    Lot-level hits carry no date fields — dates are fetched once per unique sale
+    slug from the sale page and cached in sale_date_cache.
+
     NOTE: Sotheby's typically lists FP Journe and De Bethune auction lots only
     in the lead-up to their dedicated watch sale events (2–3× per year).
     The scraper correctly returns 0 when no lots are in market.
     """
     BASE = "https://www.sothebys.com"
-    # (brand_label, creator_slug_or_None, search_query)
-    # FP Journe has a dedicated creator page; De Bethune uses the search endpoint.
     queries = [
         ("FP Journe",  "f-p-journe",  "f.p. journe"),
         ("De Bethune", None,           "de bethune"),
     ]
     lots: list[AuctionLot] = []
+    # slug like "2026/important-watches-4"  →  (sale_date_str, sale_date_end_iso)
+    sale_date_cache: dict[str, tuple[str, str | None]] = {}
 
     for brand, creator_slug, search_q in queries:
-        # Try the creator collection page first (faster, SSR-cached)
         hits: list[dict] = []
         if creator_slug:
             url = f"{BASE}/en/buy/luxury/watches/watch/{creator_slug}?waysToBuy=bid"
@@ -1533,7 +1595,6 @@ def scrape_sothebys(session: requests.Session) -> list[AuctionLot]:
                     except Exception as exc:
                         log.warning("Sotheby's %s creator-page JSON error: %s", brand, exc)
 
-        # Fall back to search endpoint if creator page unavailable / returned nothing
         if not hits and search_q:
             url = f"{BASE}/en/search?query={quote_plus(search_q)}"
             resp = fetch(url, session)
@@ -1553,8 +1614,6 @@ def scrape_sothebys(session: requests.Session) -> list[AuctionLot]:
         log.info("Sotheby's %s: %d candidate hit(s)", brand, len(hits))
 
         for h in hits:
-            # Reject marketplace / private-sale items via any available signal:
-            #   waysToBuy (creator page) or type/salesChannel (search page)
             if (
                 h.get("waysToBuy") == "buyNow"
                 or h.get("type") == "Buy Now"
@@ -1562,13 +1621,9 @@ def scrape_sothebys(session: requests.Session) -> list[AuctionLot]:
             ):
                 continue
 
-            # Sotheby's auction lots should have a distinct low/high estimate
-            # (not equal to listPrice, which is a fixed retail price)
             low        = h.get("lowEstimate")  or 0
             high       = h.get("highEstimate") or 0
             list_price = h.get("listPrice")    or 0
-
-            # Marketplace sentinel: low == high == listPrice (all nonzero)  →  skip
             if low and high and low == high == list_price:
                 continue
 
@@ -1583,31 +1638,30 @@ def scrape_sothebys(session: requests.Session) -> list[AuctionLot]:
             else:
                 estimate = "TBA"
 
-            # Lot URL
             lot_path = h.get("url", "") or h.get("slug", "")
             if lot_path.startswith("http"):
                 lot_url = lot_path
             elif lot_path:
                 lot_url = f"{BASE}/en/{lot_path.lstrip('/')}"
             else:
-                lot_url = url   # fallback to the search page
+                lot_url = url
 
-            # Sale date — prefer lot-level date fields over publishDate
-            from datetime import datetime, timezone
+            # Derive sale slug from lot path: /en/buy/auction/YEAR/SALE-NAME/lot-slug
+            # → "YEAR/SALE-NAME"
             sale_date = "TBA"
-            for ts_field in ("saleDate", "auctionDate", "startDate", "publishDate"):
-                ts = h.get(ts_field) or 0
-                if ts:
-                    try:
-                        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-                        sale_date = f"{dt.strftime('%b')} {dt.day}, {dt.year}"
-                    except Exception:
-                        pass
-                    break
+            sale_date_end = None
+            slug_clean = lot_path.lstrip("/")
+            # slug_clean like "en/buy/auction/2026/important-watches-4/elegante-..."
+            m_slug = re.match(r"(?:en/buy/auction/)?(\d{4}/[^/]+)/", slug_clean)
+            if m_slug:
+                sale_slug = m_slug.group(1)
+                if sale_slug not in sale_date_cache:
+                    sale_date_cache[sale_slug] = _sothebys_sale_dates(session, sale_slug, BASE)
+                sale_date, sale_date_end = sale_date_cache[sale_slug]
 
-            location  = h.get("saleLocation") or h.get("location") or "Sotheby's"
-            sale_name = h.get("saleName") or h.get("sale_name") or "Sotheby's Watch Sale"
-            lot_number = str(h.get("lotNumber") or h.get("lot_number") or "")
+            location   = h.get("saleLocation") or h.get("location") or h.get("auctionLocation") or "Sotheby's"
+            sale_name  = h.get("saleName") or h.get("sale_name") or "Sotheby's Watch Sale"
+            lot_number = str(h.get("lotNumber") or h.get("lot_number") or h.get("lotNr") or "")
             image_url  = h.get("imageUrl") or h.get("image_url") or ""
 
             lots.append(AuctionLot(
@@ -1624,6 +1678,7 @@ def scrape_sothebys(session: requests.Session) -> list[AuctionLot]:
                 estimate_low=float(low) if low else None,
                 estimate_high=float(high) if high else None,
                 currency=currency,
+                sale_date_end=sale_date_end,
             ))
 
         time.sleep(1)
