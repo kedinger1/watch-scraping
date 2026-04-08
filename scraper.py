@@ -2375,11 +2375,11 @@ def scrape_barnebys(session: requests.Session) -> list[AuctionLot]:
     """
     Barnebys auction aggregator — upcoming lots only.
 
-    Barnebys is a React SPA — window.__redux is populated by client-side JS,
-    not present in raw server HTML. Playwright executes JS and waits for Redux
-    hydration before extracting the state object.
+    Barnebys is a React SPA — window.__BARNEBYS_REDUX_STORE__ is populated by
+    client-side JS, not present in raw server HTML. Playwright executes JS,
+    waits for the store to initialise, then reads state via getState().
 
-    window.__redux.search.resultState.rawResults[0].hits[]
+    __BARNEBYS_REDUX_STORE__.getState().search.resultState.rawResults[0].hits[]
 
     Each hit: uid, ah (auction house), url, img, i18n (title),
     ts.starts/ends (Unix timestamps), priceE (estimate range), loc (location).
@@ -2409,33 +2409,22 @@ def scrape_barnebys(session: requests.Session) -> list[AuctionLot]:
         for brand, query in queries:
             url = f"{BASE}/auctions/search?q={quote_plus(query)}"
             pg = ctx.new_page()
-            html = ""
+            redux = {}
             try:
-                pg.goto(url, wait_until="networkidle", timeout=45_000)
+                pg.goto(url, wait_until="domcontentloaded", timeout=45_000)
                 pg.wait_for_function(
-                    "() => window.__redux && window.__redux.search && window.__redux.search.resultState",
-                    timeout=15_000,
+                    "() => window.__BARNEBYS_REDUX_STORE__ && window.__BARNEBYS_REDUX_STORE__.getState",
+                    timeout=20_000,
                 )
-                html = pg.content()
+                redux = pg.evaluate("() => window.__BARNEBYS_REDUX_STORE__.getState()")
             except PwTimeout:
-                log.warning("Barnebys %s: timed out waiting for __redux", brand)
+                log.warning("Barnebys %s: timed out waiting for __BARNEBYS_REDUX_STORE__", brand)
             except Exception as exc:
                 log.warning("Barnebys %s: page error: %s", brand, exc)
             finally:
                 pg.close()
 
-            if not html:
-                continue
-
-            m = re.search(r'window\.__redux\s*=\s*(\{.*?\});\s*</script>', html, re.DOTALL)
-            if not m:
-                log.warning("Barnebys %s: __redux not found in rendered HTML", brand)
-                continue
-
-            try:
-                redux = json.loads(m.group(1))
-            except json.JSONDecodeError as exc:
-                log.warning("Barnebys %s: JSON parse error: %s", brand, exc)
+            if not redux:
                 continue
 
             raw_results = (
