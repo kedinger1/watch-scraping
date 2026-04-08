@@ -2080,6 +2080,198 @@ def scrape_barnebys(session: requests.Session) -> list[AuctionLot]:
     return lots
 
 
+# ── LiveAuctioneers ────────────────────────────────────────────────────────────
+def scrape_liveauctioneers(session: requests.Session) -> list[AuctionLot]:
+    """
+    LiveAuctioneers upcoming lot scraper.
+
+    Search pages embed all data in window.__data (Next.js hydration).
+    Key paths:
+      window.__data.search.itemIds        — ordered list of lot IDs
+      window.__data.search.totalPages     — pagination
+      window.__data.itemSummary.byId      — lot detail objects
+
+    We query status=upcoming, status=online, and status=live to cover all
+    active auction states. Results are deduplicated by itemId.
+
+    Image URL pattern:
+      https://p1.liveauctioneers.com/{sellerId}/{catalogId}/{itemId}_1_x.jpg
+        ?quality=80&version={imageVersion}
+    """
+    from datetime import datetime, timezone
+
+    BASE     = "https://www.liveauctioneers.com"
+    IMG_BASE = "https://p1.liveauctioneers.com"
+    STATUSES = ["upcoming", "online", "live"]
+
+    queries = [
+        ("FP Journe",  "fp journe"),
+        ("De Bethune", "de bethune"),
+    ]
+
+    # Brand title guard — reject false-positive hits where neither brand name
+    # appears in the lot title or short description
+    _brand_re = {
+        "FP Journe":  re.compile(r"journe", re.IGNORECASE),
+        "De Bethune": re.compile(r"bethune", re.IGNORECASE),
+    }
+
+    lots: list[AuctionLot] = []
+    seen_ids: set[int] = set()
+
+    def _extract_window_data(html: str) -> dict:
+        """Extract and parse window.__data = {...}; from page HTML."""
+        m = re.search(r'window\.__data\s*=\s*(\{.*?\});\s*(?:</script>|window\.)', html, re.DOTALL)
+        if not m:
+            return {}
+        raw = m.group(1)
+        # Replace JS `undefined` with JSON null
+        raw = re.sub(r'\bundefined\b', 'null', raw)
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+
+    def _fmt_ts(ts: int) -> str:
+        if not ts:
+            return "TBA"
+        try:
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            return f"{dt.strftime('%b')} {dt.day}, {dt.year}"
+        except Exception:
+            return "TBA"
+
+    def _iso_ts(ts: int) -> str | None:
+        if not ts:
+            return None
+        try:
+            return datetime.fromtimestamp(ts, tz=timezone.utc).date().isoformat()
+        except Exception:
+            return None
+
+    for brand, keyword in queries:
+        brand_re = _brand_re[brand]
+
+        for status in STATUSES:
+            page = 1
+            while True:
+                url = (
+                    f"{BASE}/search/?keyword={quote_plus(keyword)}"
+                    f"&status={status}&page={page}"
+                )
+                resp = fetch(url, session)
+                if not resp:
+                    break
+
+                data = _extract_window_data(resp.text)
+                if not data:
+                    log.warning("LiveAuctioneers %s/%s p%d: no window.__data", brand, status, page)
+                    break
+
+                search    = data.get("search", {})
+                item_ids  = search.get("itemIds") or []
+                total_pgs = search.get("totalPages") or 1
+                by_id     = data.get("itemSummary", {}).get("byId") or {}
+
+                for item_id in item_ids:
+                    if item_id in seen_ids:
+                        continue
+
+                    h = by_id.get(str(item_id)) or by_id.get(item_id) or {}
+                    if not h:
+                        continue
+
+                    title = h.get("title") or ""
+                    desc  = h.get("shortDescription") or ""
+
+                    # Reject false positives
+                    if not brand_re.search(title) and not brand_re.search(desc):
+                        continue
+
+                    # Skip sold / done lots
+                    if h.get("isSold") or h.get("catalogStatus") in ("done", "archive", "passed"):
+                        continue
+
+                    seen_ids.add(item_id)
+
+                    # Estimate
+                    low_e  = h.get("lowBidEstimate")  or 0
+                    high_e = h.get("highBidEstimate") or 0
+                    currency = h.get("currency") or "USD"
+                    sign = {"USD": "$", "EUR": "€", "GBP": "£"}.get(currency, currency + " ")
+                    if low_e and high_e and low_e != high_e:
+                        estimate = f"{sign}{int(low_e):,} – {sign}{int(high_e):,}"
+                    elif low_e or high_e:
+                        estimate = f"{sign}{int(low_e or high_e):,}"
+                    else:
+                        estimate = "—"
+
+                    # Dates
+                    start_ts = h.get("saleStartTs") or 0
+                    end_ts   = h.get("lotEndTimeEstimatedTs") or h.get("saleEndEstimatedTs") or 0
+                    sale_date     = _fmt_ts(start_ts) if start_ts else _fmt_ts(end_ts)
+                    sale_date_end = _iso_ts(end_ts) if end_ts != start_ts else None
+
+                    # Location
+                    city    = h.get("lotLocationCity") or h.get("sellerCity") or ""
+                    region  = h.get("lotLocationRegion") or h.get("sellerStateCode") or ""
+                    country = h.get("lotLocationCountryCode") or ""
+                    location = ", ".join(filter(None, [city, region or country])) or "LiveAuctioneers"
+
+                    # Lot URL
+                    slug    = h.get("slug") or ""
+                    lot_url = f"{BASE}/item/{item_id}_{slug}" if slug else f"{BASE}/item/{item_id}"
+
+                    # Image URL
+                    seller_id  = h.get("sellerId") or ""
+                    catalog_id = h.get("catalogId") or ""
+                    img_ver    = h.get("imageVersion") or ""
+                    photos     = h.get("photos") or []
+                    if seller_id and catalog_id and photos:
+                        image_url = (
+                            f"{IMG_BASE}/{seller_id}/{catalog_id}/{item_id}_1_x.jpg"
+                            f"?quality=80&version={img_ver}"
+                        )
+                    else:
+                        image_url = ""
+
+                    auction_house = h.get("sellerName") or "LiveAuctioneers"
+                    catalog_title = h.get("catalogTitle") or auction_house
+                    lot_number    = str(h.get("lotNumber") or "").lstrip("0") or ""
+
+                    lots.append(AuctionLot(
+                        title=title,
+                        estimate=estimate,
+                        sale_date=sale_date,
+                        sale_location=location,
+                        image_url=image_url,
+                        lot_url=lot_url,
+                        brand=brand,
+                        auction_house=auction_house,
+                        sale_name=catalog_title,
+                        lot_number=lot_number,
+                        estimate_low=float(low_e) if low_e else None,
+                        estimate_high=float(high_e) if high_e else None,
+                        currency=currency,
+                        sale_date_end=sale_date_end,
+                    ))
+
+                log.info(
+                    "LiveAuctioneers %s/%s p%d: %d new lot(s)",
+                    brand, status, page, len(item_ids),
+                )
+
+                if page >= total_pgs:
+                    break
+                page += 1
+                time.sleep(1)
+
+            time.sleep(1)
+
+    log.info("LiveAuctioneers total: %d lot(s)", len(lots))
+    return lots
+
+
 # ── Deduplication ──────────────────────────────────────────────────────────────
 def deduplicate(listings: list[Listing]) -> list[Listing]:
     seen: set[str] = set()
@@ -2200,10 +2392,11 @@ def gather_all(
 
     # Auction house scrapers — return AuctionLot, not Listing
     auction_scrapers = [
-        ("Phillips",    scrape_phillips),
-        ("Sotheby's",   scrape_sothebys),
-        ("Christie's",  scrape_christies),
-        ("Barnebys",    scrape_barnebys),
+        ("Phillips",          scrape_phillips),
+        ("Sotheby's",         scrape_sothebys),
+        ("Christie's",        scrape_christies),
+        ("Barnebys",          scrape_barnebys),
+        ("LiveAuctioneers",   scrape_liveauctioneers),
     ]
     for auction_name, auction_fn in auction_scrapers:
         label = f"{auction_name} (upcoming)"
@@ -2736,7 +2929,7 @@ if __name__ == "__main__":
         session.headers.update(HEADERS)
         all_auction_lots: list[AuctionLot] = []
         all_stats: list[dict] = []
-        for house, fn in [("Phillips", scrape_phillips), ("Sotheby's", scrape_sothebys), ("Christie's", scrape_christies), ("Barnebys", scrape_barnebys)]:
+        for house, fn in [("Phillips", scrape_phillips), ("Sotheby's", scrape_sothebys), ("Christie's", scrape_christies), ("Barnebys", scrape_barnebys), ("LiveAuctioneers", scrape_liveauctioneers)]:
             log.info("── Scraping %s (auction lots) …", house)
             try:
                 lots = fn(session)
