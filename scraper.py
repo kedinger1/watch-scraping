@@ -2365,15 +2365,22 @@ def scrape_barnebys(session: requests.Session) -> list[AuctionLot]:
     """
     Barnebys auction aggregator — upcoming lots only.
 
-    Barnebys embeds search results in a Redux state object on their search page:
-      window.__redux.search.resultState.rawResults[0].hits[]
+    Barnebys is a React SPA — window.__redux is populated by client-side JS,
+    not present in raw server HTML. Playwright executes JS and waits for Redux
+    hydration before extracting the state object.
 
-    Each hit contains: uid, ah (auction house), url, img, i18n (title),
-    ts.ends (Unix timestamp), priceE (estimate range), loc (location).
+    window.__redux.search.resultState.rawResults[0].hits[]
 
-    We search /auctions/search?q=<brand> which returns only active/upcoming lots
-    (as opposed to /realized-prices/search which returns sold lots).
+    Each hit: uid, ah (auction house), url, img, i18n (title),
+    ts.starts/ends (Unix timestamps), priceE (estimate range), loc (location).
     """
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
+    except ImportError:
+        raise RuntimeError("Playwright not installed — skipping Barnebys")
+
+    from datetime import datetime, timezone
+
     BASE = "https://www.barnebys.com"
     queries = [
         ("FP Journe",  "fp journe"),
@@ -2382,118 +2389,137 @@ def scrape_barnebys(session: requests.Session) -> list[AuctionLot]:
     lots: list[AuctionLot] = []
     seen_urls: set[str] = set()
 
-    for brand, query in queries:
-        url = f"{BASE}/auctions/search?q={quote_plus(query)}"
-        resp = fetch(url, session)
-        if not resp:
-            log.warning("Barnebys %s: no response", brand)
-            continue
-
-        # Extract __redux JSON from script tag
-        m = re.search(r'window\.__redux\s*=\s*(\{.*?\});\s*</script>', resp.text, re.DOTALL)
-        if not m:
-            log.warning("Barnebys %s: __redux not found", brand)
-            continue
-
-        try:
-            redux = json.loads(m.group(1))
-        except json.JSONDecodeError as exc:
-            log.warning("Barnebys %s: JSON parse error: %s", brand, exc)
-            continue
-
-        raw_results = (
-            redux.get("search", {})
-                 .get("resultState", {})
-                 .get("rawResults", [{}])
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        ctx = browser.new_context(
+            user_agent=HEADERS["User-Agent"],
+            viewport={"width": 1280, "height": 800},
         )
-        hits = raw_results[0].get("hits", []) if raw_results else []
-        log.info("Barnebys %s: %d hit(s)", brand, len(hits))
 
-        from datetime import datetime, timezone
-        for h in hits:
-            lot_url = h.get("url", "")
-            if not lot_url:
-                continue
-            if not lot_url.startswith("http"):
-                lot_url = BASE + lot_url
-            if lot_url in seen_urls:
-                continue
-            seen_urls.add(lot_url)
+        for brand, query in queries:
+            url = f"{BASE}/auctions/search?q={quote_plus(query)}"
+            pg = ctx.new_page()
+            html = ""
+            try:
+                pg.goto(url, wait_until="networkidle", timeout=45_000)
+                pg.wait_for_function(
+                    "() => window.__redux && window.__redux.search && window.__redux.search.resultState",
+                    timeout=15_000,
+                )
+                html = pg.content()
+            except PwTimeout:
+                log.warning("Barnebys %s: timed out waiting for __redux", brand)
+            except Exception as exc:
+                log.warning("Barnebys %s: page error: %s", brand, exc)
+            finally:
+                pg.close()
 
-            # Title from i18n — prefer English, fall back to first available
-            i18n = h.get("i18n") or {}
-            title = (
-                i18n.get("en", {}).get("title")
-                or next((v.get("title") for v in i18n.values() if isinstance(v, dict) and v.get("title")), None)
-                or "Unknown"
+            if not html:
+                continue
+
+            m = re.search(r'window\.__redux\s*=\s*(\{.*?\});\s*</script>', html, re.DOTALL)
+            if not m:
+                log.warning("Barnebys %s: __redux not found in rendered HTML", brand)
+                continue
+
+            try:
+                redux = json.loads(m.group(1))
+            except json.JSONDecodeError as exc:
+                log.warning("Barnebys %s: JSON parse error: %s", brand, exc)
+                continue
+
+            raw_results = (
+                redux.get("search", {})
+                     .get("resultState", {})
+                     .get("rawResults", [{}])
             )
+            hits = raw_results[0].get("hits", []) if raw_results else []
+            log.info("Barnebys %s: %d hit(s)", brand, len(hits))
 
-            # Image
-            img = h.get("img") or ""
-            if img and not img.startswith("http"):
-                img = "https:" + img
+            for h in hits:
+                lot_url = h.get("url", "")
+                if not lot_url:
+                    continue
+                if not lot_url.startswith("http"):
+                    lot_url = BASE + lot_url
+                if lot_url in seen_urls:
+                    continue
+                seen_urls.add(lot_url)
 
-            # Estimate — priceE is a dict like {"USD": [low, high], "EUR": [...]}
-            price_e = h.get("priceE") or {}
-            estimate = "—"
-            for currency in ("USD", "EUR", "GBP", "SEK", "CHF"):
-                rng = price_e.get(currency)
-                if rng and len(rng) >= 2 and rng[0] and rng[1]:
-                    sign = {"USD": "$", "EUR": "€", "GBP": "£", "SEK": "SEK ", "CHF": "CHF "}.get(currency, currency + " ")
-                    estimate = f"{sign}{int(rng[0]):,} – {sign}{int(rng[1]):,}"
-                    break
+                # Title from i18n — prefer English, fall back to first available
+                i18n = h.get("i18n") or {}
+                title = (
+                    i18n.get("en", {}).get("title")
+                    or next((v.get("title") for v in i18n.values() if isinstance(v, dict) and v.get("title")), None)
+                    or "Unknown"
+                )
 
-            # Sale dates: ts.starts = open, ts.ends = close
-            ts = h.get("ts") or {}
-            starts_ts = ts.get("starts") or 0
-            ends_ts   = ts.get("ends")   or 0
-            sale_date = "—"
-            sale_date_end_iso = None
-            if starts_ts:
-                try:
-                    dt = datetime.fromtimestamp(starts_ts, tz=timezone.utc)
-                    sale_date = f"{dt.strftime('%b')} {dt.day}, {dt.year}"
-                except Exception:
-                    pass
-            elif ends_ts:
-                # Fall back to close date if no open date
-                try:
-                    dt = datetime.fromtimestamp(ends_ts, tz=timezone.utc)
-                    sale_date = f"{dt.strftime('%b')} {dt.day}, {dt.year}"
-                except Exception:
-                    pass
-            if ends_ts:
-                try:
-                    dt_end = datetime.fromtimestamp(ends_ts, tz=timezone.utc)
-                    sale_date_end_iso = dt_end.date().isoformat()
-                except Exception:
-                    pass
+                # Image
+                img = h.get("img") or ""
+                if img and not img.startswith("http"):
+                    img = "https:" + img
 
-            # Location
-            loc = h.get("loc") or {}
-            location = loc.get("city") or loc.get("region") or loc.get("country") or "Barnebys"
+                # Estimate
+                price_e = h.get("priceE") or {}
+                estimate = "—"
+                est_currency = "USD"
+                for currency in ("USD", "EUR", "GBP", "SEK", "CHF"):
+                    rng = price_e.get(currency)
+                    if rng and len(rng) >= 2 and rng[0] and rng[1]:
+                        sign = {"USD": "$", "EUR": "€", "GBP": "£", "SEK": "SEK ", "CHF": "CHF "}.get(currency, currency + " ")
+                        estimate = f"{sign}{int(rng[0]):,} – {sign}{int(rng[1]):,}"
+                        est_currency = currency
+                        break
 
-            # Auction house name
-            auction_house_name = h.get("ah") or "Barnebys"
+                # Sale dates
+                ts = h.get("ts") or {}
+                starts_ts = ts.get("starts") or 0
+                ends_ts   = ts.get("ends")   or 0
+                sale_date = "—"
+                sale_date_end_iso = None
+                if starts_ts:
+                    try:
+                        dt = datetime.fromtimestamp(starts_ts, tz=timezone.utc)
+                        sale_date = f"{dt.strftime('%b')} {dt.day}, {dt.year}"
+                    except Exception:
+                        pass
+                elif ends_ts:
+                    try:
+                        dt = datetime.fromtimestamp(ends_ts, tz=timezone.utc)
+                        sale_date = f"{dt.strftime('%b')} {dt.day}, {dt.year}"
+                    except Exception:
+                        pass
+                if ends_ts:
+                    try:
+                        sale_date_end_iso = datetime.fromtimestamp(ends_ts, tz=timezone.utc).date().isoformat()
+                    except Exception:
+                        pass
 
-            lots.append(AuctionLot(
-                title=title,
-                estimate=estimate,
-                sale_date=sale_date,
-                sale_location=location,
-                image_url=img,
-                lot_url=lot_url,
-                brand=brand,
-                auction_house=auction_house_name,
-                sale_name=f"{auction_house_name}",
-                lot_number=str(h.get("uid") or ""),
-                estimate_low=float(price_e.get("USD", [0])[0]) if price_e.get("USD") else None,
-                estimate_high=float(price_e.get("USD", [0, 0])[1]) if price_e.get("USD") and len(price_e.get("USD", [])) >= 2 else None,
-                currency="USD",
-                sale_date_end=sale_date_end_iso,
-            ))
+                loc = h.get("loc") or {}
+                location = loc.get("city") or loc.get("region") or loc.get("country") or "Barnebys"
+                auction_house_name = h.get("ah") or "Barnebys"
+                rng_usd = price_e.get(est_currency, [])
 
-        time.sleep(1)
+                lots.append(AuctionLot(
+                    title=title,
+                    estimate=estimate,
+                    sale_date=sale_date,
+                    sale_location=location,
+                    image_url=img,
+                    lot_url=lot_url,
+                    brand=brand,
+                    auction_house=auction_house_name,
+                    sale_name=auction_house_name,
+                    lot_number=str(h.get("uid") or ""),
+                    estimate_low=float(rng_usd[0]) if len(rng_usd) >= 2 else None,
+                    estimate_high=float(rng_usd[1]) if len(rng_usd) >= 2 else None,
+                    currency=est_currency,
+                    sale_date_end=sale_date_end_iso,
+                ))
+
+            time.sleep(1)
+
+        browser.close()
 
     log.info("Barnebys total: %d lot(s)", len(lots))
     return lots
@@ -2504,19 +2530,23 @@ def scrape_liveauctioneers(session: requests.Session) -> list[AuctionLot]:
     """
     LiveAuctioneers upcoming lot scraper.
 
-    Search pages embed all data in window.__data (Next.js hydration).
-    Key paths:
-      window.__data.search.itemIds        — ordered list of lot IDs
-      window.__data.search.totalPages     — pagination
-      window.__data.itemSummary.byId      — lot detail objects
+    LiveAuctioneers is a Next.js SPA — window.__data is populated by client-side
+    JS, not present in raw server HTML. Playwright executes JS and waits for
+    hydration before extracting the data object.
 
-    We query status=upcoming, status=online, and status=live to cover all
-    active auction states. Results are deduplicated by itemId.
+    window.__data.search.itemIds        — ordered list of lot IDs
+    window.__data.search.totalPages     — pagination
+    window.__data.itemSummary.byId      — lot detail objects
 
-    Image URL pattern:
-      https://p1.liveauctioneers.com/{sellerId}/{catalogId}/{itemId}_1_x.jpg
-        ?quality=80&version={imageVersion}
+    Queries status=upcoming, status=online, status=live to cover all active states.
+
+    Image URL: https://p1.liveauctioneers.com/{sellerId}/{catalogId}/{itemId}_1_x.jpg
     """
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
+    except ImportError:
+        raise RuntimeError("Playwright not installed — skipping LiveAuctioneers")
+
     from datetime import datetime, timezone
 
     BASE     = "https://www.liveauctioneers.com"
@@ -2527,9 +2557,6 @@ def scrape_liveauctioneers(session: requests.Session) -> list[AuctionLot]:
         ("FP Journe",  "fp journe"),
         ("De Bethune", "de bethune"),
     ]
-
-    # Brand title guard — reject false-positive hits where neither brand name
-    # appears in the lot title or short description
     _brand_re = {
         "FP Journe":  re.compile(r"journe", re.IGNORECASE),
         "De Bethune": re.compile(r"bethune", re.IGNORECASE),
@@ -2538,22 +2565,17 @@ def scrape_liveauctioneers(session: requests.Session) -> list[AuctionLot]:
     lots: list[AuctionLot] = []
     seen_ids: set[int] = set()
 
-    def _extract_window_data(html: str) -> dict:
-        """Extract and parse window.__data = {...}; from page HTML."""
+    def _extract(html: str) -> dict:
         m = re.search(r'window\.__data\s*=\s*(\{.*?\});\s*(?:</script>|window\.)', html, re.DOTALL)
         if not m:
             return {}
-        raw = m.group(1)
-        # Replace JS `undefined` with JSON null
-        raw = re.sub(r'\bundefined\b', 'null', raw)
+        raw = re.sub(r'\bundefined\b', 'null', m.group(1))
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
             return {}
 
     def _fmt_ts(ts: int) -> str:
-        if not ts:
-            return "TBA"
         try:
             dt = datetime.fromtimestamp(ts, tz=timezone.utc)
             return f"{dt.strftime('%b')} {dt.day}, {dt.year}"
@@ -2561,131 +2583,137 @@ def scrape_liveauctioneers(session: requests.Session) -> list[AuctionLot]:
             return "TBA"
 
     def _iso_ts(ts: int) -> str | None:
-        if not ts:
-            return None
         try:
             return datetime.fromtimestamp(ts, tz=timezone.utc).date().isoformat()
         except Exception:
             return None
 
-    for brand, keyword in queries:
-        brand_re = _brand_re[brand]
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        ctx = browser.new_context(
+            user_agent=HEADERS["User-Agent"],
+            viewport={"width": 1280, "height": 800},
+        )
 
-        for status in STATUSES:
-            page = 1
-            while True:
-                url = (
-                    f"{BASE}/search/?keyword={quote_plus(keyword)}"
-                    f"&status={status}&page={page}"
-                )
-                resp = fetch(url, session)
-                if not resp:
-                    break
+        for brand, keyword in queries:
+            brand_re = _brand_re[brand]
 
-                data = _extract_window_data(resp.text)
-                if not data:
-                    log.warning("LiveAuctioneers %s/%s p%d: no window.__data", brand, status, page)
-                    break
-
-                search    = data.get("search", {})
-                item_ids  = search.get("itemIds") or []
-                total_pgs = search.get("totalPages") or 1
-                by_id     = data.get("itemSummary", {}).get("byId") or {}
-
-                for item_id in item_ids:
-                    if item_id in seen_ids:
-                        continue
-
-                    h = by_id.get(str(item_id)) or by_id.get(item_id) or {}
-                    if not h:
-                        continue
-
-                    title = h.get("title") or ""
-                    desc  = h.get("shortDescription") or ""
-
-                    # Reject false positives
-                    if not brand_re.search(title) and not brand_re.search(desc):
-                        continue
-
-                    # Skip sold / done lots
-                    if h.get("isSold") or h.get("catalogStatus") in ("done", "archive", "passed"):
-                        continue
-
-                    seen_ids.add(item_id)
-
-                    # Estimate
-                    low_e  = h.get("lowBidEstimate")  or 0
-                    high_e = h.get("highBidEstimate") or 0
-                    currency = h.get("currency") or "USD"
-                    sign = {"USD": "$", "EUR": "€", "GBP": "£"}.get(currency, currency + " ")
-                    if low_e and high_e and low_e != high_e:
-                        estimate = f"{sign}{int(low_e):,} – {sign}{int(high_e):,}"
-                    elif low_e or high_e:
-                        estimate = f"{sign}{int(low_e or high_e):,}"
-                    else:
-                        estimate = "—"
-
-                    # Dates
-                    start_ts = h.get("saleStartTs") or 0
-                    end_ts   = h.get("lotEndTimeEstimatedTs") or h.get("saleEndEstimatedTs") or 0
-                    sale_date     = _fmt_ts(start_ts) if start_ts else _fmt_ts(end_ts)
-                    sale_date_end = _iso_ts(end_ts) if end_ts != start_ts else None
-
-                    # Location
-                    city    = h.get("lotLocationCity") or h.get("sellerCity") or ""
-                    region  = h.get("lotLocationRegion") or h.get("sellerStateCode") or ""
-                    country = h.get("lotLocationCountryCode") or ""
-                    location = ", ".join(filter(None, [city, region or country])) or "LiveAuctioneers"
-
-                    # Lot URL
-                    slug    = h.get("slug") or ""
-                    lot_url = f"{BASE}/item/{item_id}_{slug}" if slug else f"{BASE}/item/{item_id}"
-
-                    # Image URL
-                    seller_id  = h.get("sellerId") or ""
-                    catalog_id = h.get("catalogId") or ""
-                    img_ver    = h.get("imageVersion") or ""
-                    photos     = h.get("photos") or []
-                    if seller_id and catalog_id and photos:
-                        image_url = (
-                            f"{IMG_BASE}/{seller_id}/{catalog_id}/{item_id}_1_x.jpg"
-                            f"?quality=80&version={img_ver}"
+            for status in STATUSES:
+                page = 1
+                while True:
+                    url = (
+                        f"{BASE}/search/?keyword={quote_plus(keyword)}"
+                        f"&status={status}&page={page}"
+                    )
+                    pg = ctx.new_page()
+                    html = ""
+                    try:
+                        pg.goto(url, wait_until="networkidle", timeout=45_000)
+                        pg.wait_for_function(
+                            "() => window.__data && window.__data.search && window.__data.search.itemIds",
+                            timeout=15_000,
                         )
-                    else:
-                        image_url = ""
+                        html = pg.content()
+                    except PwTimeout:
+                        log.warning("LiveAuctioneers %s/%s p%d: timed out", brand, status, page)
+                    except Exception as exc:
+                        log.warning("LiveAuctioneers %s/%s p%d: error: %s", brand, status, page, exc)
+                    finally:
+                        pg.close()
 
-                    auction_house = h.get("sellerName") or "LiveAuctioneers"
-                    catalog_title = h.get("catalogTitle") or auction_house
-                    lot_number    = str(h.get("lotNumber") or "").lstrip("0") or ""
+                    if not html:
+                        break
 
-                    lots.append(AuctionLot(
-                        title=title,
-                        estimate=estimate,
-                        sale_date=sale_date,
-                        sale_location=location,
-                        image_url=image_url,
-                        lot_url=lot_url,
-                        brand=brand,
-                        auction_house=auction_house,
-                        sale_name=catalog_title,
-                        lot_number=lot_number,
-                        estimate_low=float(low_e) if low_e else None,
-                        estimate_high=float(high_e) if high_e else None,
-                        currency=currency,
-                        sale_date_end=sale_date_end,
-                    ))
+                    data = _extract(html)
+                    if not data:
+                        log.warning("LiveAuctioneers %s/%s p%d: no window.__data", brand, status, page)
+                        break
 
-                log.info(
-                    "LiveAuctioneers %s/%s p%d: %d new lot(s)",
-                    brand, status, page, len(item_ids),
-                )
+                    search    = data.get("search", {})
+                    item_ids  = search.get("itemIds") or []
+                    total_pgs = search.get("totalPages") or 1
+                    by_id     = data.get("itemSummary", {}).get("byId") or {}
 
-                if page >= total_pgs:
-                    break
-                page += 1
+                    for item_id in item_ids:
+                        if item_id in seen_ids:
+                            continue
+                        h = by_id.get(str(item_id)) or by_id.get(item_id) or {}
+                        if not h:
+                            continue
+
+                        title = h.get("title") or ""
+                        desc  = h.get("shortDescription") or ""
+                        if not brand_re.search(title) and not brand_re.search(desc):
+                            continue
+                        if h.get("isSold") or h.get("catalogStatus") in ("done", "archive", "passed"):
+                            continue
+
+                        seen_ids.add(item_id)
+
+                        low_e    = h.get("lowBidEstimate")  or 0
+                        high_e   = h.get("highBidEstimate") or 0
+                        currency = h.get("currency") or "USD"
+                        sign     = {"USD": "$", "EUR": "€", "GBP": "£"}.get(currency, currency + " ")
+                        if low_e and high_e and low_e != high_e:
+                            estimate = f"{sign}{int(low_e):,} – {sign}{int(high_e):,}"
+                        elif low_e or high_e:
+                            estimate = f"{sign}{int(low_e or high_e):,}"
+                        else:
+                            estimate = "—"
+
+                        start_ts      = h.get("saleStartTs") or 0
+                        end_ts        = h.get("lotEndTimeEstimatedTs") or h.get("saleEndEstimatedTs") or 0
+                        sale_date     = _fmt_ts(start_ts) if start_ts else _fmt_ts(end_ts)
+                        sale_date_end = _iso_ts(end_ts) if end_ts and end_ts != start_ts else None
+
+                        city     = h.get("lotLocationCity") or h.get("sellerCity") or ""
+                        region   = h.get("lotLocationRegion") or h.get("sellerStateCode") or ""
+                        country  = h.get("lotLocationCountryCode") or ""
+                        location = ", ".join(filter(None, [city, region or country])) or "LiveAuctioneers"
+
+                        slug    = h.get("slug") or ""
+                        lot_url = f"{BASE}/item/{item_id}_{slug}" if slug else f"{BASE}/item/{item_id}"
+
+                        seller_id  = h.get("sellerId") or ""
+                        catalog_id = h.get("catalogId") or ""
+                        img_ver    = h.get("imageVersion") or ""
+                        photos     = h.get("photos") or []
+                        image_url  = (
+                            f"{IMG_BASE}/{seller_id}/{catalog_id}/{item_id}_1_x.jpg?quality=80&version={img_ver}"
+                            if seller_id and catalog_id and photos else ""
+                        )
+
+                        auction_house = h.get("sellerName") or "LiveAuctioneers"
+                        catalog_title = h.get("catalogTitle") or auction_house
+                        lot_number    = str(h.get("lotNumber") or "").lstrip("0") or ""
+
+                        lots.append(AuctionLot(
+                            title=title,
+                            estimate=estimate,
+                            sale_date=sale_date,
+                            sale_location=location,
+                            image_url=image_url,
+                            lot_url=lot_url,
+                            brand=brand,
+                            auction_house=auction_house,
+                            sale_name=catalog_title,
+                            lot_number=lot_number,
+                            estimate_low=float(low_e) if low_e else None,
+                            estimate_high=float(high_e) if high_e else None,
+                            currency=currency,
+                            sale_date_end=sale_date_end,
+                        ))
+
+                    log.info("LiveAuctioneers %s/%s p%d/%d: %d item(s)", brand, status, page, total_pgs, len(item_ids))
+
+                    if page >= total_pgs:
+                        break
+                    page += 1
+                    time.sleep(2)
+
                 time.sleep(1)
 
-            time.sleep(1)
+        browser.close()
 
     log.info("LiveAuctioneers total: %d lot(s)", len(lots))
     return lots
