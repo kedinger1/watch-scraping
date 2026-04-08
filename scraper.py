@@ -1873,16 +1873,25 @@ def scrape_christies(session: requests.Session) -> list[AuctionLot]:
 
                 pg = ctx.new_page()
                 pg.on("response", _on_response)
+                html = ""
                 try:
-                    pg.goto(url, wait_until="networkidle", timeout=60_000)
-                    pg.wait_for_timeout(3_000)
+                    # domcontentloaded avoids hanging on Cloudflare background
+                    # requests that prevent networkidle from ever firing.
+                    # wait_for_load_state("load") then a short pause lets XHR
+                    # responses arrive before we read the page.
+                    pg.goto(url, wait_until="domcontentloaded", timeout=60_000)
+                    pg.wait_for_load_state("load", timeout=30_000)
+                    pg.wait_for_timeout(4_000)
                     html = pg.content()
                 except PwTimeout:
                     log.warning("Christie's %s page %d timed out", brand, page_idx + 1)
-                    pg.close()
-                    break
+                except Exception as exc:
+                    log.warning("Christie's %s page %d error: %s", brand, page_idx + 1, exc)
                 finally:
                     pg.close()
+
+                if not html:
+                    break
 
                 page_lots: list[AuctionLot] = []
 
