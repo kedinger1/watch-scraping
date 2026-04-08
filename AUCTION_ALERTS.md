@@ -1,52 +1,71 @@
 # Auction Alert System — Design Plan
 
-## Two triggered emails per lot (no weekly digest)
+## Two triggered emails per sale event (not per lot)
 
-### Email 1 — New Lot Detected
-Fires immediately when a new lot appears in `auction_lots` that wasn't present on the previous run.
+The meaningful unit is the **sale event**, not the individual lot. George doesn't need 16 emails for Sotheby's Important Watches 4 — he needs one email saying "Sotheby's has a sale coming with 15 FPJ + 1 DB."
 
-**Subject:** `New FPJ lot — Répétition Souveraine, €400K–800K, Monaco Legend, closes Apr 25`
+---
+
+### Email 1 — New Sale Event Detected
+Fires once when a new `sale_name` + `auction_house` combination appears in `auction_lots` for the first time.
+
+**Subject:** `Sotheby's — Important Watches 4, Hong Kong, Apr 24 — 15 FPJ · 1 DB`
 
 Content:
-- Photo, title, estimate, auction house, sale date / close date
-- Direct lot URL
+- Sale name, auction house, location, open → close date
+- FPJ lots listed with title, estimate, lot URL (photo + one-liner)
+- DB lots listed the same way
 - Registration deadline note where relevant (Invaluable requires 48hr advance)
 - Link to full upcoming auctions page (see below)
 
+**Trigger logic:** Query `auction_lots` grouped by `(auction_house, sale_name)` where `alerted_new IS NULL`. Fire one email per new group, then mark all rows in that group `alerted_new = now`.
+
+---
+
 ### Email 2 — 48-Hour Close Reminder
-Fires when a lot's `sale_date_end` (or `sale_date`) is within 48 hours and the lot is still active.
+Fires once per sale event when the sale is closing within 48 hours and hasn't been reminded yet.
 
-**Subject:** `Closes Thursday — FPJ Répétition Souveraine, Monaco Legend`
+**Subject:** `Closes Thursday — Sotheby's Important Watches 4, Hong Kong (15 FPJ · 1 DB)`
 
-Content: same as Email 1, with urgency callout at top.
+Content: same as Email 1, urgency callout at top ("Sale closes in ~X hours").
+
+**Trigger logic:** Query `auction_lots` grouped by `(auction_house, sale_name)` where `sale_date` (or `sale_date_end`) is within 48 hours AND `alerted_close IS NULL`. Fire one email per group, mark `alerted_close = now`.
 
 ---
 
 ## "All Upcoming Auctions" Page
 
-A simple hosted page (could be a static HTML file served from GitHub Pages, or a Supabase-backed page) showing all active `auction_lots` rows where `is_upcoming = true`, sorted by close date.
+A simple hosted page showing all `auction_lots` where `is_upcoming = true`, grouped by sale event and sorted by close date.
 
 - George gets this link at the bottom of every alert email
-- Gives him confidence that coverage is comprehensive even between alerts
-- No login, no dashboard — just a clean read-only list
+- Gives him a complete picture of what's coming even between alerts
+- No login, no dashboard — clean read-only list
 
-**Fields to show:** Brand, title, estimate, auction house, sale date open → close, lot link
+**Layout:** One card per sale event showing auction house, sale name, location, date range, FPJ count, DB count, and expandable lot list.
+
+---
+
+## Supabase Schema Changes Needed
+
+```sql
+ALTER TABLE auction_lots ADD COLUMN IF NOT EXISTS alerted_new   TIMESTAMPTZ;
+ALTER TABLE auction_lots ADD COLUMN IF NOT EXISTS alerted_close TIMESTAMPTZ;
+```
 
 ---
 
 ## Implementation Notes
 
-- New-lot detection: compare current `auction_lots` against a `first_seen_at` timestamp or a separate `alerted_new` boolean column
-- 48hr reminder: query `auction_lots` where `sale_date_end` BETWEEN now AND now+48hr AND `alerted_close` IS NULL, then set `alerted_close = now`
-- Both emails send via Resend, same infrastructure as daily digest
-- Add `alerted_new` and `alerted_close` boolean columns to `auction_lots` Supabase table
-- Triggered from the auction scrape job (weekly) — but 48hr reminders need a separate daily check, could run inside the existing daily scrape job
+- Group key: `(auction_house, sale_name)` — uniquely identifies a sale event across all sources
+- Edge case: if a sale adds new lots after the first alert (e.g. Sotheby's publishes lots in waves), only alert on the first detection. Don't re-alert on incremental additions.
+- 48hr reminder fires from the **daily scrape job** (scrape.yml), not the weekly auction job — so it catches close dates regardless of when the weekly ran
+- Both emails via Resend, same infrastructure as daily digest
 
 ---
 
 ## Status
 - [ ] Add `alerted_new` + `alerted_close` columns to `auction_lots`
-- [ ] Build new-lot detection + email
-- [ ] Build 48hr close reminder check + email
+- [ ] Build new sale event detection + Email 1
+- [ ] Build 48hr close reminder + Email 2
 - [ ] Build "all upcoming auctions" page
-- [ ] Wire 48hr check into daily scrape job
+- [ ] Wire 48hr check into daily scrape job (scrape.yml)
