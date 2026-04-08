@@ -40,6 +40,7 @@ Built and maintained by [The 1916 Company](https://www.1916company.com).
 | **Barnebys** *(auctions)* | `__redux` embedded JSON (React/Algolia search) |
 | **LiveAuctioneers** *(auctions)* | `window.__data` embedded JSON (Next.js hydration) |
 | **Invaluable** *(auctions)* | Playwright + Bright Data proxy; intercepts POST `/catResults` (Algolia) |
+| **Antiquorum** *(auctions)* | HTML scraping (BeautifulSoup); server-rendered Rails catalog |
 
 > **Note on Chrono24:** Chrono24 surfaces ~900 FP Journe and ~96 De Bethune listings, but per internal intel approximately 70% are broker placeholder listings — the watch is not held inventory; the dealer will source it through their network if they get a hit. Including Chrono24 would flood the digest with noise and undermine the signal from sources where the watch actually exists. It remains in the codebase but is intentionally not connected.
 
@@ -54,7 +55,7 @@ Sources ranked by implementation priority. Phillips, Sotheby's, and Christie's a
 | 1 | ~~**Barnebys**~~ | ✅ Live — Europe-wide aggregator | `__redux` embedded JSON |
 | 2 | ~~**LiveAuctioneers**~~ | ✅ Live — US aggregator, hundreds of small houses | `window.__data` embedded JSON |
 | 3 | ~~**Invaluable**~~ | ✅ Live — broadest small-house coverage globally | Playwright + Bright Data; intercepts `/catResults` |
-| 4 | **Antiquorum** | Watch specialist — different buyer pool, pricing signal | XHR on catalog.antiquorum.swiss |
+| 4 | ~~**Antiquorum**~~ | ✅ Live — watch specialist, different buyer pool | HTML scraping via BeautifulSoup |
 | 5 | **Drouot** | French market | Server-rendered HTML |
 
 **Skipped:** Heritage Auctions (actively anti-scrape, overlapping US audience), Fellows (near-zero FPJ/De Bethune presence).

@@ -2146,6 +2146,220 @@ def scrape_invaluable(session: requests.Session) -> list[AuctionLot]:
     return lots
 
 
+# ── Antiquorum ─────────────────────────────────────────────────────────────────
+def scrape_antiquorum(session: requests.Session) -> list[AuctionLot]:
+    """
+    Antiquorum catalog scraper (catalog.antiquorum.swiss).
+
+    Antiquorum is a watch-only auction house (~10 sales/year across Geneva,
+    Hong Kong, Monaco). Their catalog is server-rendered Rails with no bot
+    protection — plain requests + BeautifulSoup works fine.
+
+    Strategy:
+    1. Fetch catalog homepage to discover upcoming auction slugs.
+    2. For each upcoming auction, paginate /en/auctions/{slug}/lots?page=N.
+    3. Filter lot cards by brand name in title text.
+
+    Lot card structure:
+      <a href="/en/lots/{slug}?page=1"> — lot URL + title
+      <img src="https://images-catalog.antiquorum.swiss/images/{id}/lots/{n}/medium_1.jpg">
+      Estimate text: "CHF 10,000 - 20,000" (multiple currencies per card)
+
+    No keyword search via URL — must scrape all lots and filter in Python.
+    """
+    from datetime import datetime, timezone
+    from bs4 import BeautifulSoup
+
+    CATALOG_BASE = "https://catalog.antiquorum.swiss"
+    LOTS_PER_PAGE = 20
+
+    _brand_re = {
+        "FP Journe":  re.compile(r"journe", re.IGNORECASE),
+        "De Bethune": re.compile(r"bethune|de\s*bethune", re.IGNORECASE),
+    }
+
+    # ── Step 1: discover upcoming auctions ────────────────────────────────────
+    resp = fetch(CATALOG_BASE, session)
+    if not resp:
+        log.warning("Antiquorum: catalog homepage unreachable")
+        return []
+
+    soup = BeautifulSoup(resp.text, "lxml")
+    upcoming_auctions: list[tuple[str, str, str]] = []  # (slug, name, date_str)
+
+    # Auction links on homepage follow /en/auctions/{slug}/lots or /en/auctions/{slug}
+    for a in soup.find_all("a", href=re.compile(r"/en/auctions/[^/]+")):
+        href = a["href"]
+        slug_m = re.match(r"/en/auctions/([^/?]+)", href)
+        if not slug_m:
+            continue
+        slug = slug_m.group(1)
+        if any(s == slug for s, _, _ in upcoming_auctions):
+            continue
+
+        # Infer date from slug (e.g. "Hong_Kong_March_13_2026" → look for year)
+        year_m = re.search(r"(20\d\d)", slug)
+        if not year_m:
+            continue  # skip auctions with no year — likely navigation links
+        year = int(year_m.group(1))
+        if year < datetime.now().year:
+            continue  # past year, skip
+
+        name = slug.replace("_", " ").title()
+        upcoming_auctions.append((slug, name, slug))
+
+    if not upcoming_auctions:
+        log.warning("Antiquorum: no upcoming auctions found on homepage")
+        return []
+
+    log.info("Antiquorum: %d upcoming auction(s) found", len(upcoming_auctions))
+
+    # ── Step 2: scrape lots from each auction ─────────────────────────────────
+    lots: list[AuctionLot] = []
+    seen_urls: set[str] = set()
+
+    for slug, auction_name, _ in upcoming_auctions:
+        auction_url = f"{CATALOG_BASE}/en/auctions/{slug}/lots"
+        log.info("Antiquorum: scraping %s", slug)
+
+        # Determine total pages from page 1
+        resp = fetch(auction_url, session)
+        if not resp:
+            continue
+
+        soup = BeautifulSoup(resp.text, "lxml")
+
+        # Total lot count from header (e.g. "154 lots")
+        total_text = soup.find(string=re.compile(r"\d+\s+lots?", re.IGNORECASE))
+        total_lots = 0
+        if total_text:
+            m = re.search(r"(\d+)\s+lots?", str(total_text), re.IGNORECASE)
+            if m:
+                total_lots = int(m.group(1))
+        total_pages = max(1, (total_lots + LOTS_PER_PAGE - 1) // LOTS_PER_PAGE) if total_lots else 1
+
+        # Extract sale date from slug for display
+        months = {"january":1,"february":2,"march":3,"april":4,"may":5,"june":6,
+                  "july":7,"august":8,"september":9,"october":10,"november":11,"december":12}
+        sale_date = "—"
+        slug_lower = slug.lower().replace("_", " ")
+        for month_name, month_num in months.items():
+            if month_name in slug_lower:
+                year_m = re.search(r"(20\d\d)", slug)
+                day_m  = re.search(rf"{month_name}\s+(\d{{1,2}})", slug_lower)
+                if year_m:
+                    year  = year_m.group(1)
+                    day   = day_m.group(1) if day_m else "1"
+                    try:
+                        dt = datetime(int(year), month_num, int(day))
+                        sale_date = f"{dt.strftime('%b')} {dt.day}, {year}"
+                    except Exception:
+                        sale_date = f"{month_name.title()} {year}"
+                break
+
+        # Location from slug
+        cities = ["geneva", "hong kong", "hongkong", "monaco", "new york", "paris", "zurich"]
+        location = "Antiquorum"
+        for city in cities:
+            if city.replace(" ", "") in slug_lower.replace(" ", ""):
+                location = city.replace("hong kong", "Hong Kong").title()
+                break
+
+        for page_num in range(1, total_pages + 1):
+            page_url = f"{auction_url}?page={page_num}" if page_num > 1 else auction_url
+            if page_num > 1:
+                resp = fetch(page_url, session)
+                if not resp:
+                    break
+                soup = BeautifulSoup(resp.text, "lxml")
+
+            # Find lot cards — each lot has an anchor with /en/lots/{slug}
+            lot_links = soup.find_all("a", href=re.compile(r"/en/lots/[^?]+"))
+            processed_hrefs: set[str] = set()
+
+            for a in lot_links:
+                href = a["href"].split("?")[0]
+                if href in processed_hrefs or href in seen_urls:
+                    continue
+                processed_hrefs.add(href)
+
+                # Get surrounding card context for title + estimate
+                card = a.find_parent(class_=re.compile(r"lot|card|item", re.IGNORECASE)) or a.parent
+                title_text = a.get_text(separator=" ", strip=True)
+
+                if not title_text or len(title_text) < 5:
+                    continue
+
+                # Brand filter
+                matched_brand = None
+                for brand, brand_re in _brand_re.items():
+                    if brand_re.search(title_text):
+                        matched_brand = brand
+                        break
+                if not matched_brand:
+                    continue
+
+                seen_urls.add(href)
+                lot_url = CATALOG_BASE + href
+
+                # Image — look for img sibling/child
+                img_tag = (card.find("img") if card else None) or a.find("img")
+                image_url = img_tag["src"] if img_tag and img_tag.get("src") else ""
+
+                # Estimate — look for CHF/EUR/USD pattern in card text
+                card_text = card.get_text(" ", strip=True) if card else ""
+                estimate = "—"
+                # Prefer CHF estimate
+                est_m = re.search(
+                    r'(CHF|USD|EUR|HKD)\s*([\d,]+)\s*[-–]\s*([\d,]+)',
+                    card_text, re.IGNORECASE
+                )
+                if est_m:
+                    currency = est_m.group(1).upper()
+                    low_s  = est_m.group(2).replace(",", "")
+                    high_s = est_m.group(3).replace(",", "")
+                    sign = {"CHF": "CHF ", "USD": "$", "EUR": "€", "HKD": "HKD "}.get(currency, currency + " ")
+                    try:
+                        low_f  = float(low_s)
+                        high_f = float(high_s)
+                        estimate = f"{sign}{int(low_f):,} – {sign}{int(high_f):,}"
+                        estimate_low  = low_f
+                        estimate_high = high_f
+                    except ValueError:
+                        estimate_low = estimate_high = None
+                else:
+                    estimate_low = estimate_high = None
+
+                # Lot number from title or URL slug
+                lot_num_m = re.search(r"lot[_\-\s]*(\d+)", href, re.IGNORECASE)
+                lot_number = lot_num_m.group(1) if lot_num_m else ""
+
+                lots.append(AuctionLot(
+                    title=title_text,
+                    estimate=estimate,
+                    sale_date=sale_date,
+                    sale_location=location,
+                    image_url=image_url,
+                    lot_url=lot_url,
+                    brand=matched_brand,
+                    auction_house="Antiquorum",
+                    sale_name=auction_name,
+                    lot_number=lot_number,
+                    estimate_low=estimate_low,
+                    estimate_high=estimate_high,
+                    currency="CHF",
+                ))
+
+            time.sleep(1)
+
+        log.info("Antiquorum %s: %d brand lot(s) found", slug, sum(
+            1 for l in lots if l.sale_name == auction_name
+        ))
+
+    log.info("Antiquorum total: %d lot(s)", len(lots))
+    return lots
+
+
 # ── Barnebys ───────────────────────────────────────────────────────────────────
 def scrape_barnebys(session: requests.Session) -> list[AuctionLot]:
     """
@@ -2603,6 +2817,7 @@ def gather_all(
         ("Barnebys",          scrape_barnebys),
         ("LiveAuctioneers",   scrape_liveauctioneers),
         ("Invaluable",        scrape_invaluable),
+        ("Antiquorum",        scrape_antiquorum),
     ]
     for auction_name, auction_fn in auction_scrapers:
         label = f"{auction_name} (upcoming)"
@@ -3135,7 +3350,7 @@ if __name__ == "__main__":
         session.headers.update(HEADERS)
         all_auction_lots: list[AuctionLot] = []
         all_stats: list[dict] = []
-        for house, fn in [("Phillips", scrape_phillips), ("Sotheby's", scrape_sothebys), ("Christie's", scrape_christies), ("Barnebys", scrape_barnebys), ("LiveAuctioneers", scrape_liveauctioneers), ("Invaluable", scrape_invaluable)]:
+        for house, fn in [("Phillips", scrape_phillips), ("Sotheby's", scrape_sothebys), ("Christie's", scrape_christies), ("Barnebys", scrape_barnebys), ("LiveAuctioneers", scrape_liveauctioneers), ("Invaluable", scrape_invaluable), ("Antiquorum", scrape_antiquorum)]:
             log.info("── Scraping %s (auction lots) …", house)
             try:
                 lots = fn(session)
