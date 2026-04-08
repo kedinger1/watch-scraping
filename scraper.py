@@ -2042,25 +2042,26 @@ def scrape_invaluable(session: requests.Session) -> list[AuctionLot]:
                     f"&page={page_idx + 1}"
                 )
                 captured: list[dict] = []
+                pg = ctx.new_page()
+                try:
+                    # Use domcontentloaded — networkidle never fires while
+                    # Cloudflare's JS challenge keeps making background requests.
+                    # Instead, wait explicitly for the /catResults POST response.
+                    with pg.expect_response(
+                        lambda r: "/catResults" in r.url and r.request.method == "POST",
+                        timeout=90_000,
+                    ) as resp_info:
+                        pg.goto(url, wait_until="domcontentloaded", timeout=60_000)
 
-                def _on_response(response, _captured=captured):
-                    if "/catResults" not in response.url:
-                        return
+                    cat_resp = resp_info.value
                     try:
-                        if "json" in response.headers.get("content-type", ""):
-                            _captured.append(response.json())
+                        captured.append(cat_resp.json())
                     except Exception:
                         pass
-
-                pg = ctx.new_page()
-                pg.on("response", _on_response)
-                try:
-                    pg.goto(url, wait_until="networkidle", timeout=60_000)
-                    pg.wait_for_timeout(2_000)
                 except PwTimeout:
-                    log.warning("Invaluable %s page %d timed out", brand, page_idx + 1)
-                    pg.close()
-                    break
+                    log.warning("Invaluable %s page %d timed out waiting for /catResults", brand, page_idx + 1)
+                except Exception as exc:
+                    log.warning("Invaluable %s page %d error: %s", brand, page_idx + 1, exc)
                 finally:
                     pg.close()
 
