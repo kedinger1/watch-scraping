@@ -1941,6 +1941,211 @@ def scrape_christies(session: requests.Session) -> list[AuctionLot]:
     return lots
 
 
+# ── Invaluable ─────────────────────────────────────────────────────────────────
+def scrape_invaluable(session: requests.Session) -> list[AuctionLot]:
+    """
+    Invaluable.com upcoming lot scraper using Playwright + Bright Data proxy.
+
+    Invaluable is protected by Cloudflare — plain requests always 403.
+    The site POSTs to /catResults (an Algolia proxy) on each search page load.
+
+    Strategy:
+    1. Launch Chromium via Bright Data proxy to bypass Cloudflare.
+    2. Navigate to /search?query={kw}&keyword={kw}&page={n}.
+    3. Intercept POST /catResults responses to capture Algolia JSON.
+    4. Paginate by navigating to &page=N until nbPages exhausted.
+
+    Response structure:
+      results[0].hits[]        — lot objects
+      results[0].nbPages       — total pages
+    Hit fields: lotTitle, lotRef, lotNumber, photoPath, houseName,
+                dateTimeUTCUnix, endTimeUTCUnix, dateTimeLocal,
+                estimateLow, estimateHigh, currencyCode, currencySymbol
+
+    Lot URL:  https://www.invaluable.com/auction-lot/{title-slug}-{lotNumber}-c-{lotRef.lower()}
+    Image URL: https://cdn.invaluable.com/housePhotos/{photoPath}
+    """
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
+    except ImportError:
+        raise RuntimeError("Playwright not installed — skipping Invaluable")
+
+    proxy_url = os.environ.get("BRIGHT_DATA_PROXY", "")
+    if not proxy_url:
+        raise RuntimeError("BRIGHT_DATA_PROXY not set — skipping Invaluable")
+
+    from urllib.parse import urlparse as _urlparse
+    from datetime import datetime, timezone
+
+    _p = _urlparse(proxy_url)
+    playwright_proxy = {
+        "server":   f"{_p.scheme or 'http'}://{_p.hostname}:{_p.port}",
+        "username": _p.username or "",
+        "password": _p.password or "",
+    }
+
+    BASE     = "https://www.invaluable.com"
+    IMG_BASE = "https://cdn.invaluable.com/housePhotos"
+
+    searches = [
+        ("FP Journe",  "fp journe"),
+        ("De Bethune", "de bethune"),
+    ]
+
+    _brand_re = {
+        "FP Journe":  re.compile(r"journe", re.IGNORECASE),
+        "De Bethune": re.compile(r"bethune", re.IGNORECASE),
+    }
+
+    def _slugify(text: str) -> str:
+        return re.sub(r'[^a-z0-9]+', '-', text.lower()).strip('-')
+
+    def _fmt_ts(ts: int) -> str:
+        try:
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            return f"{dt.strftime('%b')} {dt.day}, {dt.year}"
+        except Exception:
+            return "—"
+
+    def _iso_ts(ts: int) -> str | None:
+        try:
+            return datetime.fromtimestamp(ts, tz=timezone.utc).date().isoformat()
+        except Exception:
+            return None
+
+    lots: list[AuctionLot] = []
+    seen_refs: set[str] = set()
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(
+            headless=True,
+            proxy=playwright_proxy,
+        )
+        ctx = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                "Version/18.5 Mobile/15E148 Safari/604.1"
+            ),
+            viewport={"width": 390, "height": 844},
+            ignore_https_errors=True,
+        )
+
+        for brand, keyword in searches:
+            brand_re = _brand_re[brand]
+            page_idx = 0
+
+            while True:
+                url = (
+                    f"{BASE}/search?query={quote_plus(keyword)}"
+                    f"&keyword={quote_plus(keyword)}"
+                    f"&page={page_idx + 1}"
+                )
+                captured: list[dict] = []
+
+                def _on_response(response, _captured=captured):
+                    if "/catResults" not in response.url:
+                        return
+                    try:
+                        if "json" in response.headers.get("content-type", ""):
+                            _captured.append(response.json())
+                    except Exception:
+                        pass
+
+                pg = ctx.new_page()
+                pg.on("response", _on_response)
+                try:
+                    pg.goto(url, wait_until="networkidle", timeout=60_000)
+                    pg.wait_for_timeout(2_000)
+                except PwTimeout:
+                    log.warning("Invaluable %s page %d timed out", brand, page_idx + 1)
+                    pg.close()
+                    break
+                finally:
+                    pg.close()
+
+                if not captured:
+                    log.warning("Invaluable %s page %d: no /catResults response", brand, page_idx + 1)
+                    break
+
+                result_set = captured[-1].get("results", [{}])[0]
+                hits     = result_set.get("hits", [])
+                nb_pages = result_set.get("nbPages", 1)
+
+                page_lots = 0
+                for h in hits:
+                    lot_ref = h.get("lotRef", "")
+                    if not lot_ref or lot_ref in seen_refs:
+                        continue
+
+                    title = h.get("lotTitle") or ""
+                    if not brand_re.search(title):
+                        continue
+
+                    seen_refs.add(lot_ref)
+                    page_lots += 1
+
+                    # Estimate
+                    low_e    = h.get("estimateLow")  or 0
+                    high_e   = h.get("estimateHigh") or 0
+                    currency = h.get("currencyCode") or "USD"
+                    sign     = h.get("currencySymbol") or {"USD": "$", "EUR": "€", "GBP": "£"}.get(currency, currency + " ")
+                    if low_e and high_e and low_e != high_e:
+                        estimate = f"{sign}{int(low_e):,} – {sign}{int(high_e):,}"
+                    elif low_e or high_e:
+                        estimate = f"{sign}{int(low_e or high_e):,}"
+                    else:
+                        # Fall back to currentBid as floor indicator
+                        bid = h.get("currentBid") or 0
+                        estimate = f"{sign}{int(bid):,}+" if bid else "—"
+
+                    # Dates
+                    start_ts = h.get("dateTimeUTCUnix") or 0
+                    end_ts   = h.get("endTimeUTCUnix")  or 0
+                    sale_date     = _fmt_ts(start_ts) if start_ts else (h.get("dateTimeLocal") or "—")
+                    sale_date_end = _iso_ts(end_ts) if end_ts and end_ts != start_ts else None
+
+                    # Lot URL
+                    lot_number = str(h.get("lotNumber") or "").lstrip("0") or "0"
+                    title_slug = _slugify(title)[:80]
+                    lot_url = f"{BASE}/auction-lot/{title_slug}-{lot_number}-c-{lot_ref.lower()}"
+
+                    # Image
+                    photo_path = h.get("photoPath") or ""
+                    image_url  = f"{IMG_BASE}/{photo_path}" if photo_path else ""
+
+                    house_name = h.get("houseName") or "Invaluable"
+
+                    lots.append(AuctionLot(
+                        title=title,
+                        estimate=estimate,
+                        sale_date=sale_date,
+                        sale_location=house_name,
+                        image_url=image_url,
+                        lot_url=lot_url,
+                        brand=brand,
+                        auction_house=house_name,
+                        sale_name=house_name,
+                        lot_number=lot_number,
+                        estimate_low=float(low_e) if low_e else None,
+                        estimate_high=float(high_e) if high_e else None,
+                        currency=currency,
+                        sale_date_end=sale_date_end,
+                    ))
+
+                log.info("Invaluable %s page %d/%d: %d lot(s)", brand, page_idx + 1, nb_pages, page_lots)
+
+                if page_idx + 1 >= nb_pages:
+                    break
+                page_idx += 1
+                time.sleep(2)
+
+        browser.close()
+
+    log.info("Invaluable total: %d lot(s)", len(lots))
+    return lots
+
+
 # ── Barnebys ───────────────────────────────────────────────────────────────────
 def scrape_barnebys(session: requests.Session) -> list[AuctionLot]:
     """
@@ -2397,6 +2602,7 @@ def gather_all(
         ("Christie's",        scrape_christies),
         ("Barnebys",          scrape_barnebys),
         ("LiveAuctioneers",   scrape_liveauctioneers),
+        ("Invaluable",        scrape_invaluable),
     ]
     for auction_name, auction_fn in auction_scrapers:
         label = f"{auction_name} (upcoming)"
@@ -2929,7 +3135,7 @@ if __name__ == "__main__":
         session.headers.update(HEADERS)
         all_auction_lots: list[AuctionLot] = []
         all_stats: list[dict] = []
-        for house, fn in [("Phillips", scrape_phillips), ("Sotheby's", scrape_sothebys), ("Christie's", scrape_christies), ("Barnebys", scrape_barnebys), ("LiveAuctioneers", scrape_liveauctioneers)]:
+        for house, fn in [("Phillips", scrape_phillips), ("Sotheby's", scrape_sothebys), ("Christie's", scrape_christies), ("Barnebys", scrape_barnebys), ("LiveAuctioneers", scrape_liveauctioneers), ("Invaluable", scrape_invaluable)]:
             log.info("── Scraping %s (auction lots) …", house)
             try:
                 lots = fn(session)

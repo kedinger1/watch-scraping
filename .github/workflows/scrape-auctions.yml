@@ -26,7 +26,7 @@ jobs:
       - name: Install Playwright browser (Chromium for Christie's)
         run: playwright install chromium --with-deps
 
-      - name: Refresh auction lots (Phillips, Sotheby's, Christie's, Barnebys, LiveAuctioneers)
+      - name: Refresh auction lots (Phillips, Sotheby's, Christie's, Barnebys, LiveAuctioneers, Invaluable)
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
