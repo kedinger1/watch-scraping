@@ -1630,6 +1630,260 @@ def scrape_sothebys(session: requests.Session) -> list[AuctionLot]:
     return lots
 
 
+# ── Christie's ─────────────────────────────────────────────────────────────────
+def _christies_parse_lot(h: dict, brand: str) -> Optional[AuctionLot]:
+    """Parse a single Christie's lot dict (from XHR JSON) into an AuctionLot."""
+    BASE = "https://www.christies.com"
+
+    title_raw = h.get("object_name") or h.get("title") or ""
+    maker_raw = h.get("maker") or h.get("creator_name") or h.get("creatorName") or ""
+    title = f"{maker_raw} {title_raw}".strip() if maker_raw else title_raw
+    if not title:
+        return None
+
+    lot_num  = str(h.get("lot_number") or h.get("lotNumber") or h.get("lot_id_txt") or "")
+    lot_id   = h.get("lot_id") or h.get("lotId") or ""
+    lot_path = h.get("url") or h.get("lot_url") or h.get("lotUrl") or ""
+    if lot_path:
+        lot_url = lot_path if lot_path.startswith("http") else BASE + lot_path
+    elif lot_id:
+        lot_url = f"{BASE}/en/lot/{lot_id}"
+    else:
+        lot_url = f"{BASE}/en/results?filters=department_id%3A46"
+
+    # Image
+    img_url = ""
+    for img_key in ("primary_image", "image_url", "imageUrl", "thumbnail"):
+        img_url = h.get(img_key) or ""
+        if img_url:
+            break
+    if not img_url:
+        imgs = h.get("images") or []
+        if imgs:
+            first = imgs[0] if isinstance(imgs[0], dict) else {}
+            img_url = first.get("src") or first.get("url") or first.get("image_url") or ""
+
+    # Estimate
+    low_raw  = h.get("estimate_low")  or h.get("estimateLow")  or 0
+    high_raw = h.get("estimate_high") or h.get("estimateHigh") or 0
+    currency = h.get("currency") or h.get("currency_cd") or "USD"
+    sign     = "$" if currency == "USD" else ("£" if currency == "GBP" else "€" if currency == "EUR" else currency)
+    try:
+        low_f  = float(low_raw)  if low_raw  else None
+        high_f = float(high_raw) if high_raw else None
+    except (TypeError, ValueError):
+        low_f = high_f = None
+    if low_f and high_f:
+        estimate = f"{sign}{int(low_f):,} – {sign}{int(high_f):,}"
+    else:
+        estimate = h.get("estimate_text") or h.get("price_realised_txt") or "—"
+
+    # Sale date
+    sale_date_raw = (
+        h.get("sale_date") or h.get("saleDate") or
+        h.get("auction_date") or h.get("auctionDate") or ""
+    )
+    if sale_date_raw:
+        try:
+            from datetime import datetime
+            dt = datetime.fromisoformat(str(sale_date_raw).replace("Z", "+00:00"))
+            try:
+                sale_date = dt.strftime("%B %-d, %Y")
+            except ValueError:
+                sale_date = dt.strftime("%B %#d, %Y")
+        except Exception:
+            sale_date = str(sale_date_raw)[:10]
+    else:
+        sale_date = "—"
+
+    sale_location = (
+        h.get("sale_location") or h.get("saleLocation") or
+        h.get("location") or "Christie's"
+    )
+    sale_name = (
+        h.get("sale_name") or h.get("saleName") or
+        h.get("event_name") or h.get("eventName") or "Christie's Watch Sale"
+    )
+
+    return AuctionLot(
+        title=title,
+        estimate=estimate,
+        sale_date=sale_date,
+        sale_location=sale_location,
+        image_url=img_url,
+        lot_url=lot_url,
+        brand=brand,
+        auction_house="Christie's",
+        sale_name=sale_name,
+        lot_number=lot_num,
+        estimate_low=low_f,
+        estimate_high=high_f,
+        currency=currency,
+    )
+
+
+def scrape_christies(session: requests.Session) -> list[AuctionLot]:
+    """
+    Christie's lot scraper using Playwright + Bright Data residential proxy.
+
+    Christie's resets TCP connections from cloud/datacenter IPs before any
+    HTTP exchange — plain requests won't work.  Routing Playwright through the
+    Bright Data proxy (same credential used for Chrono24) bypasses this block.
+
+    Strategy:
+    1.  Parse BRIGHT_DATA_PROXY into host/username/password for Playwright.
+    2.  Launch Chromium with that proxy; search Christie's /en/results for each
+        brand in the Watches department (filter=upcoming).
+    3.  Intercept XHR / fetch responses whose URL contains "lotfinder" or
+        "lot-search" to capture raw JSON lot data.
+    4.  Fall back to parsing __NEXT_DATA__ embedded JSON if no XHR is captured.
+
+    If BRIGHT_DATA_PROXY is not set the scraper raises (no point trying without
+    it — bare Playwright from a cloud runner is always blocked).
+    """
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
+    except ImportError:
+        raise RuntimeError("Playwright not installed — skipping Christie's")
+
+    proxy_url = os.environ.get("BRIGHT_DATA_PROXY", "")
+    if not proxy_url:
+        raise RuntimeError("BRIGHT_DATA_PROXY not set — skipping Christie's")
+
+    # Parse proxy URL: http://user:pass@host:port  →  Playwright proxy dict
+    from urllib.parse import urlparse as _urlparse
+    _p = _urlparse(proxy_url)
+    playwright_proxy = {
+        "server":   f"{_p.scheme or 'http'}://{_p.hostname}:{_p.port}",
+        "username": _p.username or "",
+        "password": _p.password or "",
+    }
+
+    BASE = "https://www.christies.com"
+    # Watches department, upcoming only, sorted by sale date
+    SEARCH_TMPL = (
+        BASE + "/en/results"
+        "?filters=department_id%3A46%7Cauction_status%3Aupcoming"
+        "&keyword={kw}"
+        "&action=sort_by&sortby=sale_date_asc"
+        "&startindex={start}"
+    )
+    PAGE_SIZE = 30  # Christie's default page size
+
+    searches = [
+        ("FP Journe",  "F.P.+Journe"),
+        ("De Bethune", "De+Bethune"),
+    ]
+
+    lots: list[AuctionLot] = []
+    captured_json: list[dict] = []  # filled by XHR interceptor
+
+    def _on_response(response):
+        """Intercept XHR responses containing lot JSON."""
+        url = response.url
+        if not any(k in url for k in ("lotfinder", "lot-search", "lotsearch", "results")):
+            return
+        if "christies.com" not in url:
+            return
+        try:
+            ct = response.headers.get("content-type", "")
+            if "json" not in ct:
+                return
+            data = response.json()
+            if isinstance(data, dict) and (
+                "lots" in data or "results" in data or "data" in data
+            ):
+                captured_json.append(data)
+        except Exception:
+            pass
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(
+            headless=True,
+            proxy=playwright_proxy,
+        )
+        ctx = browser.new_context(
+            user_agent=HEADERS["User-Agent"],
+            viewport={"width": 1440, "height": 900},
+            ignore_https_errors=True,
+        )
+
+        for brand, kw in searches:
+            for page_idx in range(MAX_PAGES):
+                start = page_idx * PAGE_SIZE
+                url = SEARCH_TMPL.format(kw=kw, start=start)
+                captured_json.clear()
+
+                pg = ctx.new_page()
+                pg.on("response", _on_response)
+                try:
+                    pg.goto(url, wait_until="networkidle", timeout=60_000)
+                    pg.wait_for_timeout(3_000)
+                    html = pg.content()
+                except PwTimeout:
+                    log.warning("Christie's %s page %d timed out", brand, page_idx + 1)
+                    pg.close()
+                    break
+                finally:
+                    pg.close()
+
+                page_lots: list[AuctionLot] = []
+
+                # ── Path A: XHR JSON captured ─────────────────────────────────
+                for data in captured_json:
+                    hits = (
+                        data.get("lots") or
+                        data.get("results") or
+                        (data.get("data") or {}).get("lots") or
+                        []
+                    )
+                    if isinstance(hits, dict):
+                        hits = hits.get("results") or hits.get("items") or []
+                    for h in hits:
+                        if not detect_brand(f"{h.get('title','')} {h.get('object_name','')} {h.get('maker','')} {kw}"):
+                            continue
+                        lot = _christies_parse_lot(h, brand)
+                        if lot:
+                            page_lots.append(lot)
+
+                # ── Path B: __NEXT_DATA__ embedded JSON ───────────────────────
+                if not page_lots:
+                    soup = BeautifulSoup(html, "lxml")
+                    nd_tag = soup.find("script", id="__NEXT_DATA__")
+                    if nd_tag and nd_tag.string:
+                        try:
+                            nd = json.loads(nd_tag.string)
+                            # Walk the props tree looking for lot arrays
+                            raw_str = json.dumps(nd)
+                            if "lot_number" in raw_str or "lotNumber" in raw_str:
+                                # Try common paths in Christie's Next.js page props
+                                props = nd.get("props", {}).get("pageProps", {})
+                                for key in ("lots", "results", "searchResults", "items"):
+                                    hits = props.get(key) or []
+                                    if hits:
+                                        break
+                                for h in hits:
+                                    if not detect_brand(f"{h.get('title','')} {h.get('object_name','')} {kw}"):
+                                        continue
+                                    lot = _christies_parse_lot(h, brand)
+                                    if lot:
+                                        page_lots.append(lot)
+                        except Exception as exc:
+                            log.debug("Christie's __NEXT_DATA__ parse error: %s", exc)
+
+                log.info("Christie's %s page %d: %d lot(s)", brand, page_idx + 1, len(page_lots))
+                lots.extend(page_lots)
+
+                if len(page_lots) < PAGE_SIZE:
+                    break  # Last page
+                time.sleep(2)
+
+        browser.close()
+
+    log.info("Christie's total: %d lot(s)", len(lots))
+    return lots
+
+
 # ── Deduplication ──────────────────────────────────────────────────────────────
 def deduplicate(listings: list[Listing]) -> list[Listing]:
     seen: set[str] = set()
@@ -1752,6 +2006,7 @@ def gather_all(
     auction_scrapers = [
         ("Phillips",    scrape_phillips),
         ("Sotheby's",   scrape_sothebys),
+        ("Christie's",  scrape_christies),
     ]
     for auction_name, auction_fn in auction_scrapers:
         label = f"{auction_name} (upcoming)"
@@ -2227,6 +2482,15 @@ Examples:
         ),
     )
     p.add_argument(
+        "--auctions-only",
+        action="store_true",
+        help=(
+            "Run only auction-house scrapers (Phillips, Sotheby's, Christie's), "
+            "save results to Supabase, and skip the email. "
+            "Designed for the weekly auction refresh GitHub Action."
+        ),
+    )
+    p.add_argument(
         "--list-sources",
         action="store_true",
         help="Print all available source names and exit.",
@@ -2247,19 +2511,48 @@ if __name__ == "__main__":
         print("Available sources (use any substring with --source):")
         for name, _ in SCRAPERS:
             print(f"  {name}")
-        print("  Phillips   (auction lots)")
-        print("  Sotheby's  (auction lots)")
+        print("  Phillips    (auction lots)")
+        print("  Sotheby's   (auction lots)")
+        print("  Christie's  (auction lots)")
         sys.exit(0)
 
     # --source alone implies no email (dev / debug mode)
-    skip_email = args.no_email or args.preview or (args.source is not None)
+    skip_email = args.no_email or args.preview or (args.source is not None) or args.auctions_only
 
     # Resend is not needed if we're not sending — skip the env check
     if skip_email:
         resend.api_key = os.environ.get("RESEND_API_KEY", "preview-mode-no-key-needed")
 
     log.info("Watch Listing Monitor starting%s…",
-             f" [source={args.source}]" if args.source else "")
+             f" [source={args.source}]" if args.source
+             else " [auctions-only]" if args.auctions_only
+             else "")
+
+    # --auctions-only: pass a sentinel that matches auction scrapers but not marketplace scrapers.
+    # Auction scraper names all contain the house name; marketplace scrapers don't contain
+    # "Phillips", "Sotheby", or "Christie", so the existing substring filter works perfectly.
+    _only = None
+    if args.auctions_only:
+        # We need to run all three auction houses — gather_all's only_source only allows one
+        # substring match, so we run each house in turn.
+        session = requests.Session()
+        session.headers.update(HEADERS)
+        all_auction_lots: list[AuctionLot] = []
+        all_stats: list[dict] = []
+        for house, fn in [("Phillips", scrape_phillips), ("Sotheby's", scrape_sothebys), ("Christie's", scrape_christies)]:
+            log.info("── Scraping %s (auction lots) …", house)
+            try:
+                lots = fn(session)
+                all_auction_lots.extend(lots)
+                all_stats.append({"source": house, "count": len(lots), "status": "ok"})
+                log.info("%s: %d lot(s)", house, len(lots))
+            except Exception as exc:
+                log.error("%s scraper failed: %s", house, exc)
+                all_stats.append({"source": house, "count": 0, "status": "failed", "error": str(exc)})
+        save_auction_lots_to_supabase(all_auction_lots)
+        print_console_summary([], all_auction_lots, all_stats)
+        log.info("Done.")
+        sys.exit(0)
 
     listings, auction_lots, stats = gather_all(only_source=args.source)
 

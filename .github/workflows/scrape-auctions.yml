@@ -1,0 +1,32 @@
+name: Auction Lot Refresh
+
+on:
+  schedule:
+    - cron: "0 14 * * 1"  # 10:00 AM EDT (UTC-4) every Monday — change to "0 15 * * 1" in early November when clocks fall back
+  workflow_dispatch:       # "Run workflow" button in GitHub Actions UI
+
+jobs:
+  scrape-auctions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Refresh auction lots (Phillips, Sotheby's, Christie's)
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          BRIGHT_DATA_PROXY: ${{ secrets.BRIGHT_DATA_PROXY }}
+        run: python scraper.py --auctions-only
