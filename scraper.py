@@ -1983,6 +1983,72 @@ BRAND_DISPLAY = {
 }
 
 
+def _is_new_today(l: "Listing") -> bool:
+    """Return True if this listing was first seen today (brand-new discovery)."""
+    if not l.first_seen_at:
+        return False
+    today = date.today()
+    today_str = f"{today.strftime('%b')} {today.day}, {today.year}"
+    return l.first_seen_at == today_str
+
+
+def new_listings_html(new_listings: list["Listing"]) -> str:
+    """
+    Compact highlight table for listings seen for the first time today.
+    Shows above the main table with a gold/amber accent to catch the eye.
+    """
+    if not new_listings:
+        return ""
+
+    rows = []
+    for l in new_listings:
+        img_cell = (
+            f'<a href="{escape(l.listing_url)}">'
+            f'<img src="{escape(l.image_url)}" width="64" height="64" '
+            f'style="object-fit:cover;border-radius:4px;display:block;border:0;" '
+            f'onerror="this.parentElement.innerHTML=\'&nbsp;\'" /></a>'
+            if l.image_url else "&nbsp;"
+        )
+        also_html = (
+            f'<br><span style="color:#bbb;font-size:10px;">also: '
+            + escape(", ".join(l.also_on))
+            + '</span>'
+            if l.also_on else ""
+        )
+        rows.append(
+            f'<tr style="border-bottom:1px solid #f0e8cc;">'
+            f'<td style="padding:10px 8px;width:80px;vertical-align:middle;">{img_cell}</td>'
+            f'<td style="padding:10px 8px;vertical-align:middle;">'
+            f'  <span style="display:inline-block;background:#b8860b;color:#fff;'
+            f'  font-size:9px;font-weight:700;letter-spacing:.8px;padding:2px 5px;'
+            f'  border-radius:3px;margin-right:6px;vertical-align:middle;">NEW</span>'
+            f'  <a href="{escape(l.listing_url)}" '
+            f'     style="color:#1a3550;font-weight:600;text-decoration:none;font-size:14px;">'
+            f'     {escape(l.title)}</a>'
+            f'</td>'
+            f'<td style="padding:10px 8px;vertical-align:middle;white-space:nowrap;'
+            f'font-weight:700;color:#2a6b2a;font-size:15px;">{escape(l.price)}</td>'
+            f'<td style="padding:10px 8px;vertical-align:middle;color:#777;font-size:12px;">'
+            f'{escape(l.source)}{also_html}</td>'
+            f'</tr>'
+        )
+
+    n = len(new_listings)
+    return (
+        f'<div style="margin:20px 0 0;border:2px solid #d4a017;border-radius:6px;overflow:hidden;">'
+        f'<div style="background:#fdf3d0;padding:8px 12px;border-bottom:1px solid #d4a017;">'
+        f'  <span style="font-size:13px;font-weight:700;color:#8b6000;letter-spacing:.3px;">'
+        f'  ★ Newly Listed Today &nbsp;</span>'
+        f'  <span style="font-size:12px;color:#a07820;">'
+        f'{n} new listing{"s" if n != 1 else ""} spotted for the first time</span>'
+        f'</div>'
+        f'<table width="100%" cellpadding="0" cellspacing="0" '
+        f'style="border-collapse:collapse;font-size:14px;background:#fffdf5;">'
+        f'<tbody>' + "".join(rows) + '</tbody>'
+        f'</table></div>'
+    )
+
+
 def build_email(
     brand: str,                    # "FP Journe" or "De Bethune"
     listings: list[Listing],
@@ -1992,26 +2058,37 @@ def build_email(
     """Build subject + plain + HTML for one brand's email."""
     today        = date.today().strftime("%B %d, %Y")
     display      = BRAND_DISPLAY.get(brand, brand)
-    b_listings   = [l for l in listings   if l.brand == brand]
+    b_listings   = [l for l in listings    if l.brand == brand]
     b_lots       = [l for l in auction_lots if l.brand == brand]
+    b_new        = [l for l in b_listings  if _is_new_today(l)]
     n_list       = len(b_listings)
     n_lots       = len(b_lots)
+    n_new        = len(b_new)
     brand_key    = "fpj" if brand == "FP Journe" else "db"
     active_src   = sum(1 for s in stats if s.get(brand_key, s.get("count", 0)) > 0)
 
     subject = (
         f"{display} Listings — {today} "
         f"({n_list} listing{'s' if n_list != 1 else ''}"
+        + (f" · {n_new} NEW" if n_new else "")
         + (f" · {n_lots} auction lot{'s' if n_lots != 1 else ''}" if n_lots else "")
         + ")"
     )
 
     # ── Plain text ───────────────────────────────────────────────────────────
     lines = [f"{display} Listings — {today}", f"{n_list} listing(s)\n"]
+    if b_new:
+        lines.append(f"── NEW TODAY ({n_new}) ──")
+        for l in b_new:
+            also = f" · also: {', '.join(l.also_on)}" if l.also_on else ""
+            lines.append(f"  ★ {l.title}")
+            lines.append(f"  {l.price} | {l.source}{also}")
+            lines.append(f"  {l.listing_url}\n")
+    lines.append(f"── All Listings ({n_list}) ──")
     for l in b_listings:
-        lines.append(f"  {l.title}")
         found = f" · found {l.first_seen_at}" if l.first_seen_at else ""
         also = f" · also: {', '.join(l.also_on)}" if l.also_on else ""
+        lines.append(f"  {l.title}")
         lines.append(f"  {l.price} | {l.source}{also}{found}")
         lines.append(f"  {l.listing_url}\n")
     if b_lots:
@@ -2024,11 +2101,19 @@ def build_email(
 
     # ── HTML ─────────────────────────────────────────────────────────────────
     count_str  = f"{n_list} listing{'s' if n_list != 1 else ''}"
+    new_str    = (
+        f' &nbsp;<span style="background:#b8860b;color:#fff;font-size:11px;'
+        f'font-weight:700;padding:2px 6px;border-radius:3px;vertical-align:middle;">'
+        f'{n_new} NEW</span>'
+        if n_new else ""
+    )
     lots_str   = (
         f' &nbsp;+&nbsp; <span style="color:#3a1a55;">'
         f'{n_lots} auction lot{"s" if n_lots != 1 else ""}</span>'
         if n_lots else ""
     )
+
+    new_section = new_listings_html(b_new)
 
     auction_html = ""
     if b_lots:
@@ -2062,14 +2147,15 @@ def build_email(
     </h2>
     <p style="margin:5px 0 0;color:#999;font-size:13px;">
       {escape(today)} &mdash;
-      <strong style="color:#444;">{count_str}</strong>{lots_str}
+      <strong style="color:#444;">{count_str}</strong>{new_str}{lots_str}
       across <strong style="color:#444;">{active_src}</strong> source{'s' if active_src != 1 else ''}
     </p>
   </div>
+  {new_section}
 
   <h3 style="margin:24px 0 10px;color:#1a3550;font-size:18px;
              border-bottom:2px solid #e0d8cc;padding-bottom:6px;">
-    {escape(display)}
+    All {escape(display)} Listings
     <span style="font-size:13px;font-weight:normal;color:#aaa;">{count_str}</span>
   </h3>
   {listing_table_html(b_listings)}
