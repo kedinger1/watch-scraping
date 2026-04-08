@@ -95,6 +95,7 @@ class AuctionLot:
     estimate_high: Optional[float] = None
     currency: str = "USD"
     is_upcoming: bool = True
+    sale_date_end: Optional[str] = None   # ISO date "2026-05-14" — close/hammer date where known
 
 
 def detect_brand(text: str) -> Optional[str]:
@@ -1453,6 +1454,7 @@ def save_auction_lots_to_supabase(lots: list[AuctionLot]) -> None:
             "estimate_high": lot.estimate_high,
             "currency":      lot.currency,
             "sale_date":     sale_date_iso,
+            "sale_date_end": lot.sale_date_end,
             "location":      lot.sale_location,
             "image_url":     lot.image_url or None,
             "is_upcoming":   True,
@@ -1967,14 +1969,29 @@ def scrape_barnebys(session: requests.Session) -> list[AuctionLot]:
                     estimate = f"{sign}{int(rng[0]):,} – {sign}{int(rng[1]):,}"
                     break
 
-            # Sale date from ts.ends (Unix timestamp)
+            # Sale dates: ts.starts = open, ts.ends = close
             ts = h.get("ts") or {}
-            ends_ts = ts.get("ends") or 0
+            starts_ts = ts.get("starts") or 0
+            ends_ts   = ts.get("ends")   or 0
             sale_date = "—"
-            if ends_ts:
+            sale_date_end_iso = None
+            if starts_ts:
+                try:
+                    dt = datetime.fromtimestamp(starts_ts, tz=timezone.utc)
+                    sale_date = f"{dt.strftime('%b')} {dt.day}, {dt.year}"
+                except Exception:
+                    pass
+            elif ends_ts:
+                # Fall back to close date if no open date
                 try:
                     dt = datetime.fromtimestamp(ends_ts, tz=timezone.utc)
                     sale_date = f"{dt.strftime('%b')} {dt.day}, {dt.year}"
+                except Exception:
+                    pass
+            if ends_ts:
+                try:
+                    dt_end = datetime.fromtimestamp(ends_ts, tz=timezone.utc)
+                    sale_date_end_iso = dt_end.date().isoformat()
                 except Exception:
                     pass
 
@@ -1999,6 +2016,7 @@ def scrape_barnebys(session: requests.Session) -> list[AuctionLot]:
                 estimate_low=float(price_e.get("USD", [0])[0]) if price_e.get("USD") else None,
                 estimate_high=float(price_e.get("USD", [0, 0])[1]) if price_e.get("USD") and len(price_e.get("USD", [])) >= 2 else None,
                 currency="USD",
+                sale_date_end=sale_date_end_iso,
             ))
 
         time.sleep(1)
