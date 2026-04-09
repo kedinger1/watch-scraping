@@ -3562,6 +3562,7 @@ def send_auction_alerts() -> int:
             except Exception as exc:
                 log.error("Failed to mark alerted_new for %s — %s: %s", auction_house, sale_name, exc)
         sent += 1
+        time.sleep(0.3)  # stay under Resend's 5 req/sec limit
 
     return sent
 
@@ -3681,6 +3682,7 @@ def send_auction_close_reminders() -> int:
             except Exception as exc:
                 log.error("Failed to mark alerted_close for %s — %s: %s", auction_house, sale_name, exc)
         sent += 1
+        time.sleep(0.3)  # stay under Resend's 5 req/sec limit
 
     return sent
 
