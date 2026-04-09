@@ -3267,6 +3267,423 @@ def build_email(
     return subject, plain, html
 
 
+def _build_alert_email(
+    auction_house: str,
+    sale_name: str,
+    location: str,
+    sale_date: str,
+    sale_date_end: str,
+    fpj_lots: list[dict],
+    db_lots: list[dict],
+    close_reminder: bool = False,
+) -> tuple[str, str, str]:
+    """
+    Build subject + plain + HTML for a single sale-event alert.
+
+    fpj_lots / db_lots are raw Supabase row dicts (keys: title, estimate_low,
+    estimate_high, currency, lot_url, image_url, lot_number, brand).
+    """
+    n_fpj = len(fpj_lots)
+    n_db  = len(db_lots)
+    total = n_fpj + n_db
+
+    # Brand pill summary e.g. "15 FPJ · 1 DB"
+    pills = " · ".join(filter(None, [
+        f"{n_fpj} FPJ" if n_fpj else "",
+        f"{n_db} DB"   if n_db  else "",
+    ]))
+
+    # Date range display
+    date_display = sale_date
+    if sale_date_end and sale_date_end != sale_date:
+        date_display = f"{sale_date} – {sale_date_end}"
+
+    if close_reminder:
+        subject = (
+            f"Closes soon — {auction_house} {sale_name}"
+            + (f", {location}" if location else "")
+            + (f" ({pills})" if pills else "")
+        )
+    else:
+        subject = (
+            f"{auction_house} — {sale_name}"
+            + (f", {location}" if location else "")
+            + (f", {date_display}" if date_display else "")
+            + (f" — {pills}" if pills else "")
+        )
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
+    CURRENCY_SIGN = {"USD": "$", "EUR": "€", "GBP": "£"}
+
+    def _fmt_estimate(row: dict) -> str:
+        low  = row.get("estimate_low")
+        high = row.get("estimate_high")
+        sign = CURRENCY_SIGN.get(row.get("currency") or "USD", "$")
+        if low and high and low != high:
+            return f"{sign}{int(low):,} – {sign}{int(high):,}"
+        if low or high:
+            return f"{sign}{int(low or high):,}"
+        return "—"
+
+    def _lot_rows_html(lots: list[dict], brand_label: str) -> str:
+        if not lots:
+            return ""
+        header_color = "#1a3550" if brand_label == "F.P. Journe" else "#3a1a55"
+        rows_html = ""
+        for row in lots:
+            est    = _fmt_estimate(row)
+            url    = row.get("lot_url") or "#"
+            img    = row.get("image_url") or ""
+            title  = row.get("title") or "—"
+            lot_no = row.get("lot_number") or ""
+            img_cell = (
+                f'<a href="{escape(url)}">'
+                f'<img src="{escape(img)}" width="80" height="80" '
+                f'style="object-fit:cover;border-radius:4px;display:block;border:0;" '
+                f'onerror="this.parentElement.innerHTML=\'&nbsp;\'" /></a>'
+            ) if img else "&nbsp;"
+            lot_num_html = (
+                f'<br><span style="color:#bbb;font-size:10px;">Lot {escape(lot_no)}</span>'
+            ) if lot_no else ""
+            rows_html += (
+                f'<tr style="border-bottom:1px solid #e8e4f0;">'
+                f'<td style="padding:10px 8px;width:96px;vertical-align:middle;">{img_cell}</td>'
+                f'<td style="padding:10px 8px;vertical-align:middle;">'
+                f'  <a href="{escape(url)}" '
+                f'     style="color:{header_color};font-weight:600;text-decoration:none;font-size:14px;">'
+                f'     {escape(title)}</a>{lot_num_html}'
+                f'</td>'
+                f'<td style="padding:10px 8px;vertical-align:middle;white-space:nowrap;'
+                f'font-weight:700;color:#5a3a80;font-size:14px;">{escape(est)}</td>'
+                f'</tr>'
+            )
+        section = (
+            f'<h3 style="margin:28px 0 8px;color:{header_color};font-size:16px;'
+            f'border-bottom:2px solid {"#d0dce8" if brand_label == "F.P. Journe" else "#d8d0e8"};'
+            f'padding-bottom:5px;">'
+            f'{escape(brand_label)} <span style="font-size:12px;font-weight:normal;color:#aaa;">'
+            f'{len(lots)} lot{"s" if len(lots) != 1 else ""}</span></h3>'
+            f'<table width="100%" cellpadding="0" cellspacing="0" '
+            f'style="border-collapse:collapse;font-size:14px;'
+            f'border:1px solid #d8d0e8;border-radius:6px;overflow:hidden;">'
+            f'<thead><tr style="background:#f5f2fa;">'
+            f'<th style="padding:9px 8px;text-align:left;font-size:11px;color:#999;'
+            f'font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Photo</th>'
+            f'<th style="padding:9px 8px;text-align:left;font-size:11px;color:#999;'
+            f'font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Lot</th>'
+            f'<th style="padding:9px 8px;text-align:left;font-size:11px;color:#999;'
+            f'font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Estimate</th>'
+            f'</tr></thead>'
+            f'<tbody>{rows_html}</tbody></table>'
+        )
+        return section
+
+    def _lot_rows_plain(lots: list[dict], brand_label: str) -> list[str]:
+        lines: list[str] = []
+        if lots:
+            lines.append(f"\n── {brand_label} ({len(lots)}) ──")
+            for row in lots:
+                lines.append(f"  {row.get('title', '—')}")
+                lines.append(f"  Est. {_fmt_estimate(row)}")
+                lines.append(f"  {row.get('lot_url', '')}\n")
+        return lines
+
+    # ── Plain text ────────────────────────────────────────────────────────────
+    plain_lines = [
+        subject,
+        f"{auction_house} · {sale_name}",
+        f"{date_display}" + (f" · {location}" if location else ""),
+        f"{total} lot(s) — {pills}",
+    ]
+    if close_reminder:
+        plain_lines.insert(0, "⚠ This sale closes soon.\n")
+    plain_lines += _lot_rows_plain(fpj_lots, "F.P. Journe")
+    plain_lines += _lot_rows_plain(db_lots, "De Bethune")
+    plain = "\n".join(plain_lines)
+
+    # ── HTML ──────────────────────────────────────────────────────────────────
+    urgency_banner = ""
+    if close_reminder:
+        urgency_banner = (
+            '<div style="background:#b94040;color:#fff;padding:12px 16px;'
+            'border-radius:6px;margin-bottom:20px;font-weight:700;font-size:15px;">'
+            '⚠ This sale closes within 48 hours'
+            '</div>'
+        )
+
+    html = f"""<!DOCTYPE html>
+<html>
+<body style="font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;
+             max-width:900px;margin:auto;color:#222;padding:24px;background:#fff;">
+
+  {urgency_banner}
+
+  <div style="border-bottom:3px solid #1a3550;padding-bottom:14px;margin-bottom:4px;">
+    <h2 style="margin:0;font-size:22px;color:#1a3550;letter-spacing:-.3px;">
+      {escape(auction_house)} — {escape(sale_name)}
+    </h2>
+    <p style="margin:5px 0 0;color:#777;font-size:13px;">
+      {escape(date_display)}
+      {(" &mdash; " + escape(location)) if location else ""}
+      &nbsp;&nbsp;
+      <strong style="color:#3a1a55;">{escape(pills)}</strong>
+    </p>
+  </div>
+
+  {_lot_rows_html(fpj_lots, "F.P. Journe")}
+  {_lot_rows_html(db_lots, "De Bethune")}
+
+</body>
+</html>"""
+
+    return subject, plain, html
+
+
+def send_auction_alerts() -> int:
+    """
+    Detect new sale events in auction_lots and send one alert email per event.
+
+    Trigger: rows where alerted_new IS NULL and is_upcoming = true.
+    Groups by (auction_house, sale_name).
+    After sending, marks all rows in that group alerted_new = now().
+
+    Returns the number of alert emails sent.
+    """
+    url_env = os.environ.get("SUPABASE_URL", "")
+    key_env = os.environ.get("SUPABASE_KEY", "")
+    if not url_env or not key_env:
+        log.warning("SUPABASE_URL / SUPABASE_KEY not set — skipping auction alerts")
+        return 0
+
+    resend_key = os.environ.get("RESEND_API_KEY", "")
+    if not resend_key:
+        log.warning("RESEND_API_KEY not set — skipping auction alerts")
+        return 0
+
+    try:
+        from supabase import create_client
+    except ImportError:
+        log.warning("supabase package not installed — skipping auction alerts")
+        return 0
+
+    from datetime import datetime, timezone, date as _date
+
+    try:
+        sb = create_client(url_env, key_env)
+    except Exception as exc:
+        log.error("Supabase client init failed (auction alerts): %s", exc)
+        return 0
+
+    # Fetch all upcoming lots not yet alerted
+    try:
+        resp = (
+            sb.table("auction_lots")
+            .select(
+                "lot_url,auction_house,sale_name,brand,title,"
+                "estimate_low,estimate_high,currency,"
+                "lot_number,image_url,location,sale_date,sale_date_end"
+            )
+            .eq("is_upcoming", True)
+            .is_("alerted_new", "null")
+            .execute()
+        )
+        rows = resp.data or []
+    except Exception as exc:
+        log.error("Supabase fetch for auction alerts failed: %s", exc)
+        return 0
+
+    if not rows:
+        log.info("Auction alerts: no new sale events to notify")
+        return 0
+
+    # Group by (auction_house, sale_name)
+    from collections import defaultdict
+    groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for row in rows:
+        key = (row.get("auction_house") or "", row.get("sale_name") or "")
+        groups[key].append(row)
+
+    log.info("Auction alerts: %d new sale event(s) to notify", len(groups))
+    sent = 0
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    for (auction_house, sale_name), lot_rows in groups.items():
+        fpj_lots = [r for r in lot_rows if r.get("brand") == "FP Journe"]
+        db_lots  = [r for r in lot_rows if r.get("brand") == "De Bethune"]
+
+        # Pick representative location / dates from the group
+        location     = next((r["location"]     for r in lot_rows if r.get("location")),     "")
+        sale_date_raw = next((r["sale_date"]    for r in lot_rows if r.get("sale_date")),    "")
+        sale_date_end = next((r["sale_date_end"] for r in lot_rows if r.get("sale_date_end")), "")
+
+        # Format ISO date → human readable
+        def _fmt_date(iso: str) -> str:
+            if not iso:
+                return ""
+            try:
+                d = _date.fromisoformat(iso)
+                return f"{d.strftime('%b')} {d.day}, {d.year}"
+            except Exception:
+                return iso
+
+        sale_date_display     = _fmt_date(sale_date_raw)
+        sale_date_end_display = _fmt_date(sale_date_end)
+
+        subject, plain, html = _build_alert_email(
+            auction_house=auction_house,
+            sale_name=sale_name,
+            location=location,
+            sale_date=sale_date_display,
+            sale_date_end=sale_date_end_display,
+            fpj_lots=fpj_lots,
+            db_lots=db_lots,
+            close_reminder=False,
+        )
+
+        try:
+            resend.Emails.send({
+                "from":    RESEND_FROM,
+                "to":      RECIPIENT,
+                "subject": subject,
+                "html":    html,
+                "text":    plain,
+            })
+            log.info("Alert sent: %s — %s (%d lot(s))", auction_house, sale_name, len(lot_rows))
+        except Exception as exc:
+            log.error("Failed to send alert for %s — %s: %s", auction_house, sale_name, exc)
+            continue
+
+        # Mark all lots in this group as alerted
+        urls = [r["lot_url"] for r in lot_rows if r.get("lot_url")]
+        if urls:
+            try:
+                sb.table("auction_lots").update({"alerted_new": now_iso}).in_("lot_url", urls).execute()
+            except Exception as exc:
+                log.error("Failed to mark alerted_new for %s — %s: %s", auction_house, sale_name, exc)
+        sent += 1
+
+    return sent
+
+
+def send_auction_close_reminders() -> int:
+    """
+    Send a 48-hour close reminder for any upcoming sale events closing within 48 hours
+    that haven't been reminded yet (alerted_close IS NULL).
+
+    Groups by (auction_house, sale_name) — one email per sale event.
+    Returns number of reminder emails sent.
+    """
+    url_env = os.environ.get("SUPABASE_URL", "")
+    key_env = os.environ.get("SUPABASE_KEY", "")
+    if not url_env or not key_env:
+        return 0
+
+    resend_key = os.environ.get("RESEND_API_KEY", "")
+    if not resend_key:
+        return 0
+
+    try:
+        from supabase import create_client
+    except ImportError:
+        return 0
+
+    from datetime import datetime, timezone, timedelta, date as _date
+
+    try:
+        sb = create_client(url_env, key_env)
+    except Exception as exc:
+        log.error("Supabase client init failed (close reminders): %s", exc)
+        return 0
+
+    now_utc      = datetime.now(timezone.utc)
+    cutoff_iso   = (now_utc + timedelta(hours=48)).date().isoformat()
+    today_iso    = now_utc.date().isoformat()
+
+    try:
+        resp = (
+            sb.table("auction_lots")
+            .select(
+                "lot_url,auction_house,sale_name,brand,title,"
+                "estimate_low,estimate_high,currency,"
+                "lot_number,image_url,location,sale_date,sale_date_end"
+            )
+            .eq("is_upcoming", True)
+            .is_("alerted_close", "null")
+            .lte("sale_date_end", cutoff_iso)
+            .gte("sale_date_end", today_iso)
+            .execute()
+        )
+        rows = resp.data or []
+    except Exception as exc:
+        log.error("Supabase fetch for close reminders failed: %s", exc)
+        return 0
+
+    if not rows:
+        log.info("Close reminders: no sales closing within 48 hours")
+        return 0
+
+    from collections import defaultdict
+    groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for row in rows:
+        key = (row.get("auction_house") or "", row.get("sale_name") or "")
+        groups[key].append(row)
+
+    log.info("Close reminders: %d sale event(s) closing within 48 hours", len(groups))
+    sent = 0
+    now_iso = now_utc.isoformat()
+
+    for (auction_house, sale_name), lot_rows in groups.items():
+        fpj_lots = [r for r in lot_rows if r.get("brand") == "FP Journe"]
+        db_lots  = [r for r in lot_rows if r.get("brand") == "De Bethune"]
+
+        location      = next((r["location"]      for r in lot_rows if r.get("location")),      "")
+        sale_date_raw  = next((r["sale_date"]     for r in lot_rows if r.get("sale_date")),     "")
+        sale_date_end  = next((r["sale_date_end"] for r in lot_rows if r.get("sale_date_end")), "")
+
+        def _fmt_date(iso: str) -> str:
+            if not iso:
+                return ""
+            try:
+                d = _date.fromisoformat(iso)
+                return f"{d.strftime('%b')} {d.day}, {d.year}"
+            except Exception:
+                return iso
+
+        subject, plain, html = _build_alert_email(
+            auction_house=auction_house,
+            sale_name=sale_name,
+            location=location,
+            sale_date=_fmt_date(sale_date_raw),
+            sale_date_end=_fmt_date(sale_date_end),
+            fpj_lots=fpj_lots,
+            db_lots=db_lots,
+            close_reminder=True,
+        )
+
+        try:
+            resend.Emails.send({
+                "from":    RESEND_FROM,
+                "to":      RECIPIENT,
+                "subject": subject,
+                "html":    html,
+                "text":    plain,
+            })
+            log.info("Close reminder sent: %s — %s", auction_house, sale_name)
+        except Exception as exc:
+            log.error("Failed to send close reminder for %s — %s: %s", auction_house, sale_name, exc)
+            continue
+
+        urls = [r["lot_url"] for r in lot_rows if r.get("lot_url")]
+        if urls:
+            try:
+                sb.table("auction_lots").update({"alerted_close": now_iso}).in_("lot_url", urls).execute()
+            except Exception as exc:
+                log.error("Failed to mark alerted_close for %s — %s: %s", auction_house, sale_name, exc)
+        sent += 1
+
+    return sent
+
+
 def send_emails(
     listings: list[Listing], auction_lots: list[AuctionLot], stats: list[dict]
 ) -> None:
@@ -3390,6 +3807,10 @@ if __name__ == "__main__":
                 log.error("%s scraper failed: %s", house, exc)
                 all_stats.append({"source": house, "count": 0, "status": "failed", "error": str(exc)})
         save_auction_lots_to_supabase(all_auction_lots)
+        n_new_alerts  = send_auction_alerts()
+        n_close_alerts = send_auction_close_reminders()
+        log.info("Auction alerts: %d new sale alert(s), %d close reminder(s) sent",
+                 n_new_alerts, n_close_alerts)
         print_console_summary([], all_auction_lots, all_stats)
         log.info("Done.")
         sys.exit(0)
