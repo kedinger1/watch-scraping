@@ -2646,8 +2646,7 @@ def scrape_liveauctioneers(session: requests.Session) -> list[AuctionLot]:
                     continue
 
                 title = h.get("title") or ""
-                desc  = h.get("shortDescription") or ""
-                if not brand_re.search(title) and not brand_re.search(desc):
+                if not brand_re.search(title):
                     continue
                 if h.get("isSold") or h.get("catalogStatus") in ("done", "archive", "passed"):
                     continue
