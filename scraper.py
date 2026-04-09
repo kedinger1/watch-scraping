@@ -2801,10 +2801,13 @@ SCRAPERS = [
 
 def gather_all(
     only_source: Optional[str] = None,
+    include_auctions: bool = False,
 ) -> tuple[list[Listing], list[AuctionLot], list[dict]]:
     """
     Run all scrapers (or just one if only_source is given).
     only_source is matched case-insensitively as a substring, e.g. "chrono" matches "Chrono24".
+    include_auctions=False by default — auction lots are managed by the dedicated
+    weekly --auctions-only job and should not run in the daily scrape.
     Returns (listings, auction_lots, stats).
     """
     session = make_session()
@@ -2850,6 +2853,8 @@ def gather_all(
     ]
     for auction_name, auction_fn in auction_scrapers:
         label = f"{auction_name} (upcoming)"
+        if not include_auctions and not only_source:
+            continue
         if only_source and not _matches(auction_name, only_source):
             continue
         log.info("── Scraping %s …", auction_name)
