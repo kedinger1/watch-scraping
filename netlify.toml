@@ -3,4 +3,4 @@
   command = ""
 
 [build.environment]
-  PYTHON_VERSION = ""
+  SKIP_INSTALL_DEPS = "true"
