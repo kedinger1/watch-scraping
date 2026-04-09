@@ -43,7 +43,8 @@ log = logging.getLogger(__name__)
 # ── Configuration ──────────────────────────────────────────────────────────────
 resend.api_key = os.environ["RESEND_API_KEY"]
 RESEND_FROM = os.environ.get("RESEND_FROM", "Watch Monitor <watch@1916co.com>")
-RECIPIENT = os.environ.get("RECIPIENT_EMAIL", "you@1916co.com")
+RECIPIENT       = os.environ.get("RECIPIENT_EMAIL", "you@1916co.com")
+ALERT_RECIPIENT = os.environ.get("ALERT_RECIPIENT") or RECIPIENT  # direct recipient for auction alerts
 
 # How many result pages to fetch per brand per site (Chrono24 / eBay)
 MAX_PAGES = 3
@@ -3543,7 +3544,7 @@ def send_auction_alerts() -> int:
         try:
             resend.Emails.send({
                 "from":    RESEND_FROM,
-                "to":      RECIPIENT,
+                "to":      ALERT_RECIPIENT,
                 "subject": subject,
                 "html":    html,
                 "text":    plain,
@@ -3663,7 +3664,7 @@ def send_auction_close_reminders() -> int:
         try:
             resend.Emails.send({
                 "from":    RESEND_FROM,
-                "to":      RECIPIENT,
+                "to":      ALERT_RECIPIENT,
                 "subject": subject,
                 "html":    html,
                 "text":    plain,
