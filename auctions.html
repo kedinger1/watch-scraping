@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Upcoming Auctions — F.P. Journe &amp; De Bethune</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+      background: #f2f2f0;
+      color: #222;
+      min-height: 100vh;
+    }
+
+    header {
+      background: #1a3550;
+      color: #fff;
+      padding: 28px 32px 22px;
+    }
+    header h1 {
+      font-size: 22px;
+      font-weight: 700;
+      letter-spacing: -.3px;
+    }
+    header p {
+      margin-top: 5px;
+      font-size: 13px;
+      color: #9ab4cc;
+    }
+
+    #status {
+      text-align: center;
+      padding: 60px 16px;
+      color: #999;
+      font-size: 14px;
+    }
+
+    main {
+      max-width: 860px;
+      margin: 32px auto;
+      padding: 0 16px 60px;
+    }
+
+    .sale-card {
+      background: #fff;
+      border-radius: 8px;
+      box-shadow: 0 1px 4px rgba(0,0,0,.08);
+      margin-bottom: 24px;
+      overflow: hidden;
+    }
+
+    .sale-header {
+      padding: 16px 20px 14px;
+      border-bottom: 1px solid #eee;
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .sale-header-left h2 {
+      font-size: 16px;
+      font-weight: 700;
+      color: #1a3550;
+    }
+    .sale-header-left h2 span {
+      font-weight: 400;
+      color: #888;
+      font-size: 14px;
+    }
+    .sale-meta {
+      margin-top: 4px;
+      font-size: 12px;
+      color: #888;
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .sale-meta .dot { color: #ccc; }
+
+    .sale-header-right {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      flex-shrink: 0;
+      flex-wrap: wrap;
+    }
+
+    .pill {
+      font-size: 11px;
+      font-weight: 700;
+      padding: 3px 9px;
+      border-radius: 20px;
+      letter-spacing: .3px;
+    }
+    .pill-fpj  { background: #e8f0f8; color: #1a3550; }
+    .pill-db   { background: #ede8f5; color: #3a1a55; }
+    .pill-close {
+      background: #fdecea;
+      color: #b94040;
+      font-weight: 700;
+    }
+    .pill-soon {
+      background: #fef3e2;
+      color: #c07000;
+      font-weight: 700;
+    }
+
+    .brand-section { padding: 0 20px 4px; }
+    .brand-label {
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .6px;
+      padding: 12px 0 6px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .brand-label.fpj { color: #1a3550; border-top: 1px solid #e8f0f8; }
+    .brand-label.db  { color: #3a1a55; border-top: 1px solid #ede8f5; }
+    .brand-label:first-child { border-top: none; }
+
+    .lot-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 9px 0;
+      border-bottom: 1px solid #f0f0f0;
+    }
+    .lot-row:last-child { border-bottom: none; }
+
+    .lot-thumb {
+      width: 52px;
+      height: 52px;
+      border-radius: 4px;
+      object-fit: cover;
+      flex-shrink: 0;
+      background: #f5f5f5;
+      display: block;
+    }
+    .lot-thumb-empty {
+      width: 52px;
+      height: 52px;
+      border-radius: 4px;
+      background: #f0f0f0;
+      flex-shrink: 0;
+    }
+
+    .lot-info { flex: 1; min-width: 0; }
+    .lot-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: #1a3550;
+      text-decoration: none;
+      display: block;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .lot-title:hover { text-decoration: underline; }
+    .lot-title.db { color: #3a1a55; }
+    .lot-num {
+      font-size: 11px;
+      color: #bbb;
+      margin-top: 2px;
+    }
+
+    .lot-estimate {
+      font-size: 13px;
+      font-weight: 700;
+      color: #5a3a80;
+      white-space: nowrap;
+      flex-shrink: 0;
+      text-align: right;
+    }
+    .lot-estimate.no-est { color: #ccc; font-weight: 400; }
+
+    .empty-state {
+      text-align: center;
+      padding: 60px 16px;
+      color: #bbb;
+      font-size: 14px;
+    }
+
+    footer {
+      text-align: center;
+      padding: 24px 16px;
+      font-size: 11px;
+      color: #bbb;
+    }
+    footer strong { color: #999; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>Upcoming Auctions &mdash; F.P. Journe &amp; De Bethune</h1>
+  <p>Updated automatically each week &middot; <a href="https://www.1916company.com" style="color:#9ab4cc;">The 1916 Company</a></p>
+</header>
+
+<div id="status">Loading auction data&hellip;</div>
+<main id="main" style="display:none;"></main>
+
+<footer>
+  <strong>Monitored sources:</strong> Phillips &middot; Sotheby&rsquo;s &middot; Christie&rsquo;s &middot; Invaluable &middot; Barnebys &middot; LiveAuctioneers &middot; Antiquorum<br>
+  Coverage updated weekly. Not all auction houses are monitored. Estimates shown in original currency.
+</footer>
+
+<script>
+  // ── Config ────────────────────────────────────────────────────────────────────
+  const SUPABASE_URL      = 'YOUR_SUPABASE_URL';       // e.g. https://xxxx.supabase.co
+  const SUPABASE_ANON_KEY = 'YOUR_SUPABASE_ANON_KEY';  // Settings → API → anon public
+
+  // ── Fetch ─────────────────────────────────────────────────────────────────────
+  async function loadLots() {
+    const params = new URLSearchParams({
+      is_upcoming: 'eq.true',
+      select: 'auction_house,sale_name,brand,title,lot_number,estimate_low,estimate_high,currency,lot_url,image_url,location,sale_date,sale_date_end',
+      order: 'sale_date.asc,auction_house.asc',
+    });
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/auction_lots?${params}`, {
+      headers: {
+        apikey: SUPABASE_ANON_KEY,
+        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+      },
+    });
+    if (!res.ok) throw new Error(`Supabase error ${res.status}`);
+    return res.json();
+  }
+
+  // ── Helpers ───────────────────────────────────────────────────────────────────
+  function fmtDate(iso) {
+    if (!iso) return '';
+    const d = new Date(iso + 'T12:00:00Z');
+    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  }
+
+  function daysUntil(iso) {
+    if (!iso) return null;
+    const diff = new Date(iso + 'T23:59:59Z') - new Date();
+    return Math.ceil(diff / 86400000);
+  }
+
+  function fmtEstimate(row) {
+    const signs = { USD: '$', EUR: '€', GBP: '£' };
+    const s = signs[row.currency] || (row.currency + ' ');
+    if (row.estimate_low && row.estimate_high && row.estimate_low !== row.estimate_high)
+      return `${s}${Number(row.estimate_low).toLocaleString()} – ${s}${Number(row.estimate_high).toLocaleString()}`;
+    if (row.estimate_low || row.estimate_high)
+      return `${s}${Number(row.estimate_low || row.estimate_high).toLocaleString()}`;
+    return '—';
+  }
+
+  // ── Render ────────────────────────────────────────────────────────────────────
+  function render(lots) {
+    const main = document.getElementById('main');
+    document.getElementById('status').style.display = 'none';
+
+    if (!lots.length) {
+      main.style.display = '';
+      main.innerHTML = '<div class="empty-state">No upcoming auction lots found.</div>';
+      return;
+    }
+
+    // Group by (auction_house, sale_name)
+    const groups = new Map();
+    for (const lot of lots) {
+      const key = `${lot.auction_house}|||${lot.sale_name || lot.auction_house}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(lot);
+    }
+
+    // Sort groups by sale_date_end (soonest first), then sale_date
+    const sorted = [...groups.entries()].sort((a, b) => {
+      const da = a[1][0].sale_date_end || a[1][0].sale_date || '';
+      const db = b[1][0].sale_date_end || b[1][0].sale_date || '';
+      return da.localeCompare(db);
+    });
+
+    let html = '';
+    for (const [key, rows] of sorted) {
+      const rep       = rows[0];
+      const house     = rep.auction_house || '';
+      const saleName  = rep.sale_name && rep.sale_name !== house ? rep.sale_name : '';
+      const location  = rep.location  || '';
+      const startDate = fmtDate(rep.sale_date);
+      const endDate   = fmtDate(rep.sale_date_end);
+      const dateRange = endDate && endDate !== startDate
+        ? `${startDate} – ${endDate}`
+        : startDate || 'Date TBA';
+
+      const fpjLots = rows.filter(r => r.brand === 'FP Journe');
+      const dbLots  = rows.filter(r => r.brand === 'De Bethune');
+
+      const days = daysUntil(rep.sale_date_end || rep.sale_date);
+      let closePill = '';
+      if (days !== null && days >= 0) {
+        if (days <= 2)      closePill = `<span class="pill pill-close">Closes in ${days === 0 ? 'today' : days + (days === 1 ? ' day' : ' days')}</span>`;
+        else if (days <= 7) closePill = `<span class="pill pill-soon">Closes in ${days} days</span>`;
+      }
+
+      const pills = [
+        fpjLots.length ? `<span class="pill pill-fpj">${fpjLots.length} FPJ</span>` : '',
+        dbLots.length  ? `<span class="pill pill-db">${dbLots.length} DB</span>`   : '',
+        closePill,
+      ].filter(Boolean).join('');
+
+      const lotRowsHtml = (lotList, brand) => lotList.map(lot => {
+        const est    = fmtEstimate(lot);
+        const cls    = brand === 'db' ? 'db' : '';
+        const imgEl  = lot.image_url
+          ? `<img class="lot-thumb" src="${escHtml(lot.image_url)}" alt="" loading="lazy" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'lot-thumb-empty'}))">`
+          : `<div class="lot-thumb-empty"></div>`;
+        const numEl  = lot.lot_number ? `<div class="lot-num">Lot ${escHtml(lot.lot_number)}</div>` : '';
+        const estEl  = `<div class="lot-estimate${est === '—' ? ' no-est' : ''}">${escHtml(est)}</div>`;
+        return `
+          <div class="lot-row">
+            <a href="${escHtml(lot.lot_url)}" target="_blank" rel="noopener">${imgEl}</a>
+            <div class="lot-info">
+              <a class="lot-title ${cls}" href="${escHtml(lot.lot_url)}" target="_blank" rel="noopener">${escHtml(lot.title)}</a>
+              ${numEl}
+            </div>
+            ${estEl}
+          </div>`;
+      }).join('');
+
+      const brandSections = [
+        fpjLots.length ? `<div class="brand-label fpj">F.P. Journe <span style="font-weight:400;color:#999;margin-left:4px;">${fpjLots.length} lot${fpjLots.length !== 1 ? 's' : ''}</span></div>${lotRowsHtml(fpjLots, 'fpj')}` : '',
+        dbLots.length  ? `<div class="brand-label db">De Bethune <span style="font-weight:400;color:#999;margin-left:4px;">${dbLots.length} lot${dbLots.length !== 1 ? 's' : ''}</span></div>${lotRowsHtml(dbLots, 'db')}` : '',
+      ].filter(Boolean).join('');
+
+      html += `
+        <div class="sale-card">
+          <div class="sale-header">
+            <div class="sale-header-left">
+              <h2>${escHtml(house)}${saleName ? ` <span>— ${escHtml(saleName)}</span>` : ''}</h2>
+              <div class="sale-meta">
+                ${dateRange ? `<span>${escHtml(dateRange)}</span>` : ''}
+                ${location  ? `<span class="dot">&middot;</span><span>${escHtml(location)}</span>` : ''}
+              </div>
+            </div>
+            <div class="sale-header-right">${pills}</div>
+          </div>
+          <div class="brand-section">${brandSections}</div>
+        </div>`;
+    }
+
+    main.style.display = '';
+    main.innerHTML = html;
+  }
+
+  function escHtml(str) {
+    return String(str ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  // ── Boot ──────────────────────────────────────────────────────────────────────
+  loadLots()
+    .then(render)
+    .catch(err => {
+      document.getElementById('status').textContent = 'Failed to load auction data. ' + err.message;
+    });
+</script>
+
+</body>
+</html>
