@@ -137,10 +137,16 @@ def abs_url(href: str, base: str) -> str:
 def best_img(tag) -> str:
     if tag is None:
         return ""
-    for attr in ("data-src", "data-lazy-src", "data-original", "src"):
+    for attr in ("data-src", "data-lazy-src", "data-lazy", "data-original", "data-image-src", "src"):
         val = tag.get(attr, "")
-        if val and val.startswith(("http", "//")):
+        if val and val.startswith(("http", "//")) and not val.endswith(".gif"):
             return val if not val.startswith("//") else "https:" + val
+    # fall back to first entry in srcset
+    srcset = tag.get("srcset", "") or tag.get("data-srcset", "")
+    if srcset:
+        first = srcset.strip().split(",")[0].strip().split(" ")[0]
+        if first.startswith(("http", "//")):
+            return first if not first.startswith("//") else "https:" + first
     return ""
 
 
@@ -1663,7 +1669,14 @@ def scrape_sothebys(session: requests.Session) -> list[AuctionLot]:
             location   = h.get("saleLocation") or h.get("location") or h.get("auctionLocation") or "Sotheby's"
             sale_name  = h.get("saleName") or h.get("sale_name") or "Sotheby's Watch Sale"
             lot_number = str(h.get("lotNumber") or h.get("lot_number") or h.get("lotNr") or "")
-            image_url  = h.get("imageUrl") or h.get("image_url") or ""
+            _imgs      = h.get("images") or []
+            image_url  = (
+                h.get("imageUrl")
+                or h.get("image_url")
+                or h.get("image")
+                or (_imgs[0] if isinstance(_imgs, list) and _imgs else None)
+                or ""
+            )
 
             lots.append(AuctionLot(
                 title=title,
@@ -2852,7 +2865,7 @@ def gather_all(
         ("Antiquorum",        scrape_antiquorum),
     ]
     for auction_name, auction_fn in auction_scrapers:
-        label = f"{auction_name} (upcoming)"
+        label = auction_name
         if not include_auctions and not only_source:
             continue
         if only_source and not _matches(auction_name, only_source):
