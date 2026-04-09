@@ -29,6 +29,8 @@ jobs:
       - name: Refresh auction lots (Phillips, Sotheby's, Christie's, Barnebys, LiveAuctioneers, Invaluable, Antiquorum)
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          RESEND_FROM: ${{ secrets.RESEND_FROM }}
+          ALERT_RECIPIENT: ${{ secrets.ALERT_RECIPIENT }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           BRIGHT_DATA_PROXY: ${{ secrets.BRIGHT_DATA_PROXY }}
