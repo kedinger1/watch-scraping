@@ -3433,6 +3433,15 @@ def _build_alert_email(
   {_lot_rows_html(fpj_lots, "F.P. Journe")}
   {_lot_rows_html(db_lots, "De Bethune")}
 
+  <div style="margin-top:36px;padding-top:16px;border-top:1px solid #e8e8e8;font-size:12px;color:#bbb;">
+    <a href="https://auctionmonitoring.netlify.app"
+       style="color:#888;text-decoration:none;">View all upcoming F.P. Journe &amp; De Bethune auctions &rarr;</a><br>
+    <span style="font-size:11px;">
+      Monitored: Phillips &middot; Sotheby&rsquo;s &middot; Christie&rsquo;s &middot;
+      Invaluable &middot; Barnebys &middot; LiveAuctioneers &middot; Antiquorum
+    </span>
+  </div>
+
 </body>
 </html>"""
 
