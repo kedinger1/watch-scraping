@@ -168,7 +168,7 @@ def scrape_chrono24(session: requests.Session) -> list[Listing]:
 
     proxies = {"http": proxy_url, "https": proxy_url}
     BASE = "https://www.chrono24.com"
-    url = f"{BASE}/debethune/index.htm"
+    url = f"{BASE}/debethune/index.htm?dosearch=true&query=de+bethune"
 
     try:
         resp = session.get(url, proxies=proxies, verify=False, timeout=30)
