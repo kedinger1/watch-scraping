@@ -2529,28 +2529,28 @@ def scrape_liveauctioneers(session: requests.Session) -> list[AuctionLot]:
     """
     LiveAuctioneers upcoming lot scraper.
 
-    LiveAuctioneers is a Next.js SPA — window.__data is populated by client-side
-    JS, not present in raw server HTML. Playwright executes JS and waits for
-    hydration before extracting the data object.
+    Uses the undocumented but public search API endpoint directly — no Playwright,
+    no auth headers required:
 
-    window.__data.search.itemIds        — ordered list of lot IDs
-    window.__data.search.totalPages     — pagination
-    window.__data.itemSummary.byId      — lot detail objects
+      GET https://search-party-prod.liveauctioneers.com/search/v4/web
+        ?promoted=1
+        &parameters={JSON}
+        &useATGSearch=true
+        &c=20170802
 
-    Queries status=upcoming, status=online, status=live to cover all active states.
+    parameters JSON keys: searchTerm, options.status, page, pageSize, sort.
 
+    Response: payload.items[] — same item structure as the old window.__data approach.
+    Pagination: payload.totalPages.
     Image URL: https://p1.liveauctioneers.com/{sellerId}/{catalogId}/{itemId}_1_x.jpg
     """
-    try:
-        from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
-    except ImportError:
-        raise RuntimeError("Playwright not installed — skipping LiveAuctioneers")
-
+    import urllib.parse
     from datetime import datetime, timezone
 
-    BASE     = "https://www.liveauctioneers.com"
+    API_BASE = "https://search-party-prod.liveauctioneers.com/search/v4/web"
+    LA_BASE  = "https://www.liveauctioneers.com"
     IMG_BASE = "https://p1.liveauctioneers.com"
-    STATUSES = ["upcoming", "online", "live"]
+    PAGE_SIZE = 24
 
     queries = [
         ("FP Journe",  "fp journe"),
@@ -2563,16 +2563,6 @@ def scrape_liveauctioneers(session: requests.Session) -> list[AuctionLot]:
 
     lots: list[AuctionLot] = []
     seen_ids: set[int] = set()
-
-    def _extract(html: str) -> dict:
-        m = re.search(r'window\.__data\s*=\s*(\{.*?\});\s*(?:</script>|window\.)', html, re.DOTALL)
-        if not m:
-            return {}
-        raw = re.sub(r'\bundefined\b', 'null', m.group(1))
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            return {}
 
     def _fmt_ts(ts: int) -> str:
         try:
@@ -2587,132 +2577,142 @@ def scrape_liveauctioneers(session: requests.Session) -> list[AuctionLot]:
         except Exception:
             return None
 
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-        ctx = browser.new_context(
-            user_agent=HEADERS["User-Agent"],
-            viewport={"width": 1280, "height": 800},
-        )
+    api_session = requests.Session()
+    api_session.headers.update({
+        "User-Agent": HEADERS["User-Agent"],
+        "Origin": "https://www.liveauctioneers.com",
+        "Referer": "https://www.liveauctioneers.com/",
+    })
 
-        for brand, keyword in queries:
-            brand_re = _brand_re[brand]
+    for brand, keyword in queries:
+        brand_re = _brand_re[brand]
+        page = 1
 
-            for status in STATUSES:
-                page = 1
-                while True:
-                    url = (
-                        f"{BASE}/search/?keyword={quote_plus(keyword)}"
-                        f"&status={status}&page={page}"
-                    )
-                    pg = ctx.new_page()
-                    html = ""
-                    try:
-                        pg.goto(url, wait_until="networkidle", timeout=45_000)
-                        pg.wait_for_function(
-                            "() => window.__data && window.__data.search && window.__data.search.itemIds",
-                            timeout=15_000,
-                        )
-                        html = pg.content()
-                    except PwTimeout:
-                        log.warning("LiveAuctioneers %s/%s p%d: timed out", brand, status, page)
-                    except Exception as exc:
-                        log.warning("LiveAuctioneers %s/%s p%d: error: %s", brand, status, page, exc)
-                    finally:
-                        pg.close()
+        while True:
+            params_obj = {
+                "analyticsTags": ["web"],
+                "buyNow": False,
+                "categories": [],
+                "distance": {},
+                "options": {
+                    "status": ["upcoming", "live", "online"],
+                    "auctionHouse": [{"exclude": [], "include": []}],
+                },
+                "page": page,
+                "pageSize": PAGE_SIZE,
+                "publishDate": {},
+                "ranges": {},
+                "saleDate": {},
+                "searchTerm": keyword,
+                "citySlug": "",
+                "region": "",
+                "sort": "-relevance",
+                "seoSearch": False,
+            }
 
-                    if not html:
-                        break
+            url = (
+                f"{API_BASE}"
+                f"?promoted=1"
+                f"&parameters={urllib.parse.quote(json.dumps(params_obj))}"
+                f"&useATGSearch=true"
+                f"&c=20170802"
+            )
 
-                    data = _extract(html)
-                    if not data:
-                        log.warning("LiveAuctioneers %s/%s p%d: no window.__data", brand, status, page)
-                        break
+            resp = fetch(url, api_session)
+            if not resp:
+                log.warning("LiveAuctioneers %s p%d: no response", brand, page)
+                break
 
-                    search    = data.get("search", {})
-                    item_ids  = search.get("itemIds") or []
-                    total_pgs = search.get("totalPages") or 1
-                    by_id     = data.get("itemSummary", {}).get("byId") or {}
+            try:
+                data = resp.json()
+            except Exception:
+                log.warning("LiveAuctioneers %s p%d: JSON parse error", brand, page)
+                break
 
-                    for item_id in item_ids:
-                        if item_id in seen_ids:
-                            continue
-                        h = by_id.get(str(item_id)) or by_id.get(item_id) or {}
-                        if not h:
-                            continue
+            if data.get("error"):
+                log.warning("LiveAuctioneers %s p%d: API error", brand, page)
+                break
 
-                        title = h.get("title") or ""
-                        desc  = h.get("shortDescription") or ""
-                        if not brand_re.search(title) and not brand_re.search(desc):
-                            continue
-                        if h.get("isSold") or h.get("catalogStatus") in ("done", "archive", "passed"):
-                            continue
+            payload    = data.get("payload", {})
+            items      = payload.get("items") or []
+            total_pgs  = payload.get("totalPages") or 1
 
-                        seen_ids.add(item_id)
+            for h in items:
+                item_id = h.get("itemId") or 0
+                if not item_id or item_id in seen_ids:
+                    continue
 
-                        low_e    = h.get("lowBidEstimate")  or 0
-                        high_e   = h.get("highBidEstimate") or 0
-                        currency = h.get("currency") or "USD"
-                        sign     = {"USD": "$", "EUR": "€", "GBP": "£"}.get(currency, currency + " ")
-                        if low_e and high_e and low_e != high_e:
-                            estimate = f"{sign}{int(low_e):,} – {sign}{int(high_e):,}"
-                        elif low_e or high_e:
-                            estimate = f"{sign}{int(low_e or high_e):,}"
-                        else:
-                            estimate = "—"
+                title = h.get("title") or ""
+                desc  = h.get("shortDescription") or ""
+                if not brand_re.search(title) and not brand_re.search(desc):
+                    continue
+                if h.get("isSold") or h.get("catalogStatus") in ("done", "archive", "passed"):
+                    continue
 
-                        start_ts      = h.get("saleStartTs") or 0
-                        end_ts        = h.get("lotEndTimeEstimatedTs") or h.get("saleEndEstimatedTs") or 0
-                        sale_date     = _fmt_ts(start_ts) if start_ts else _fmt_ts(end_ts)
-                        sale_date_end = _iso_ts(end_ts) if end_ts and end_ts != start_ts else None
+                seen_ids.add(item_id)
 
-                        city     = h.get("lotLocationCity") or h.get("sellerCity") or ""
-                        region   = h.get("lotLocationRegion") or h.get("sellerStateCode") or ""
-                        country  = h.get("lotLocationCountryCode") or ""
-                        location = ", ".join(filter(None, [city, region or country])) or "LiveAuctioneers"
+                low_e    = h.get("lowBidEstimate")  or 0
+                high_e   = h.get("highBidEstimate") or 0
+                currency = h.get("currency") or "USD"
+                sign     = {"USD": "$", "EUR": "€", "GBP": "£"}.get(currency, currency + " ")
+                if low_e and high_e and low_e != high_e:
+                    estimate = f"{sign}{int(low_e):,} – {sign}{int(high_e):,}"
+                elif low_e or high_e:
+                    estimate = f"{sign}{int(low_e or high_e):,}"
+                else:
+                    estimate = "—"
 
-                        slug    = h.get("slug") or ""
-                        lot_url = f"{BASE}/item/{item_id}_{slug}" if slug else f"{BASE}/item/{item_id}"
+                start_ts      = h.get("saleStartTs") or 0
+                end_ts        = h.get("lotEndTimeEstimatedTs") or h.get("saleEndEstimatedTs") or 0
+                sale_date     = _fmt_ts(start_ts) if start_ts else _fmt_ts(end_ts)
+                sale_date_end = _iso_ts(end_ts) if end_ts and end_ts != start_ts else None
 
-                        seller_id  = h.get("sellerId") or ""
-                        catalog_id = h.get("catalogId") or ""
-                        img_ver    = h.get("imageVersion") or ""
-                        photos     = h.get("photos") or []
-                        image_url  = (
-                            f"{IMG_BASE}/{seller_id}/{catalog_id}/{item_id}_1_x.jpg?quality=80&version={img_ver}"
-                            if seller_id and catalog_id and photos else ""
-                        )
+                city     = h.get("lotLocationCity") or h.get("sellerCity") or ""
+                region   = h.get("lotLocationRegion") or h.get("sellerStateCode") or ""
+                country  = h.get("lotLocationCountryCode") or ""
+                location = ", ".join(filter(None, [city, region or country])) or "LiveAuctioneers"
 
-                        auction_house = h.get("sellerName") or "LiveAuctioneers"
-                        catalog_title = h.get("catalogTitle") or auction_house
-                        lot_number    = str(h.get("lotNumber") or "").lstrip("0") or ""
+                slug      = h.get("slugWithLocation") or h.get("slug") or ""
+                lot_url   = f"{LA_BASE}/item/{item_id}_{slug}" if slug else f"{LA_BASE}/item/{item_id}"
 
-                        lots.append(AuctionLot(
-                            title=title,
-                            estimate=estimate,
-                            sale_date=sale_date,
-                            sale_location=location,
-                            image_url=image_url,
-                            lot_url=lot_url,
-                            brand=brand,
-                            auction_house=auction_house,
-                            sale_name=catalog_title,
-                            lot_number=lot_number,
-                            estimate_low=float(low_e) if low_e else None,
-                            estimate_high=float(high_e) if high_e else None,
-                            currency=currency,
-                            sale_date_end=sale_date_end,
-                        ))
+                seller_id  = h.get("sellerId") or ""
+                catalog_id = h.get("catalogId") or ""
+                img_ver    = h.get("imageVersion") or ""
+                photos     = h.get("photos") or []
+                image_url  = (
+                    f"{IMG_BASE}/{seller_id}/{catalog_id}/{item_id}_1_x.jpg?quality=80&version={img_ver}"
+                    if seller_id and catalog_id and photos else ""
+                )
 
-                    log.info("LiveAuctioneers %s/%s p%d/%d: %d item(s)", brand, status, page, total_pgs, len(item_ids))
+                auction_house = h.get("sellerName") or "LiveAuctioneers"
+                catalog_title = h.get("catalogTitle") or auction_house
+                lot_number    = str(h.get("lotNumber") or "").lstrip("0") or ""
 
-                    if page >= total_pgs:
-                        break
-                    page += 1
-                    time.sleep(2)
+                lots.append(AuctionLot(
+                    title=title,
+                    estimate=estimate,
+                    sale_date=sale_date,
+                    sale_location=location,
+                    image_url=image_url,
+                    lot_url=lot_url,
+                    brand=brand,
+                    auction_house=auction_house,
+                    sale_name=catalog_title,
+                    lot_number=lot_number,
+                    estimate_low=float(low_e) if low_e else None,
+                    estimate_high=float(high_e) if high_e else None,
+                    currency=currency,
+                    sale_date_end=sale_date_end,
+                ))
 
-                time.sleep(1)
+            log.info("LiveAuctioneers %s p%d/%d: %d item(s)", brand, page, total_pgs, len(items))
 
-        browser.close()
+            if page >= total_pgs:
+                break
+            page += 1
+            time.sleep(1)
+
+        time.sleep(1)
 
     log.info("LiveAuctioneers total: %d lot(s)", len(lots))
     return lots
