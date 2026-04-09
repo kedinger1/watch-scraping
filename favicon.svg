@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- Background -->
+  <rect width="32" height="32" rx="6" fill="#1a3550"/>
+  <!-- Gavel head + handle, rotated 45deg -->
+  <g transform="rotate(-45, 16, 16)">
+    <!-- Head -->
+    <rect x="5" y="9" width="22" height="9" rx="3" fill="white"/>
+    <!-- Grip band on head -->
+    <rect x="14" y="9" width="4" height="9" rx="0" fill="#c8d8e8" opacity="0.5"/>
+    <!-- Handle -->
+    <rect x="13" y="18" width="6" height="13" rx="2.5" fill="#7a9fbe"/>
+  </g>
+  <!-- Strike base line -->
+  <rect x="5" y="27" width="14" height="2" rx="1" fill="white" opacity="0.25"/>
+</svg>
