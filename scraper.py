@@ -2464,7 +2464,7 @@ def scrape_barnebys(session: requests.Session) -> list[AuctionLot]:
                 est_currency = "USD"
                 for currency in ("USD", "EUR", "GBP", "SEK", "CHF"):
                     rng = price_e.get(currency)
-                    if rng and len(rng) >= 2 and rng[0] and rng[1]:
+                    if rng and isinstance(rng, (list, tuple)) and len(rng) >= 2 and rng[0] and rng[1]:
                         sign = {"USD": "$", "EUR": "€", "GBP": "£", "SEK": "SEK ", "CHF": "CHF "}.get(currency, currency + " ")
                         estimate = f"{sign}{int(rng[0]):,} – {sign}{int(rng[1]):,}"
                         est_currency = currency
@@ -2497,7 +2497,9 @@ def scrape_barnebys(session: requests.Session) -> list[AuctionLot]:
                 loc = h.get("loc") or {}
                 location = loc.get("city") or loc.get("region") or loc.get("country") or "Barnebys"
                 auction_house_name = h.get("ah") or "Barnebys"
-                rng_usd = price_e.get(est_currency, [])
+                rng_usd = price_e.get(est_currency) or []
+                if not isinstance(rng_usd, (list, tuple)):
+                    rng_usd = []
 
                 lots.append(AuctionLot(
                     title=title,
