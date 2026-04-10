@@ -202,6 +202,8 @@ def scrape_chrono24(session: requests.Session) -> list[Listing]:
 
         card = a.find_parent(class_=re.compile(r"wt-search-result|listing-item|js-listing-item")) or a
         img_tag = card.find("img")
+        if img_tag and not listings:  # log first card's img attrs once
+            log.info("Chrono24 img attrs: %s", dict(img_tag.attrs))
         img_url = best_img(img_tag)
         img_url = img_url.replace("-Square28.", "-Square40.") if img_url else ""
 
