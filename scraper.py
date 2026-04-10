@@ -202,10 +202,15 @@ def scrape_chrono24(session: requests.Session) -> list[Listing]:
 
         card = a.find_parent(class_=re.compile(r"wt-search-result|listing-item|js-listing-item")) or a
         img_tag = card.find("img")
-        if img_tag and not listings:  # log first card's img attrs once
-            log.info("Chrono24 img attrs: %s", dict(img_tag.attrs))
-        img_url = best_img(img_tag)
-        img_url = img_url.replace("-Square28.", "-Square40.") if img_url else ""
+        # Chrono24 lazy-loads via data-lazy-sweet-spot-master-src with _SIZE_ placeholder
+        img_url = ""
+        if img_tag:
+            sweet = img_tag.get("data-lazy-sweet-spot-master-src", "")
+            if sweet:
+                img_url = sweet.replace("_SIZE_", "220")
+            else:
+                img_url = best_img(img_tag)
+                img_url = img_url.replace("-Square28.", "-Square40.") if img_url else ""
 
         texts = [el.get_text(" ", strip=True) for el in card.find_all(string=True, recursive=True)
                  if el.get_text(strip=True)]
