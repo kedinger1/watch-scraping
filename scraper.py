@@ -109,6 +109,15 @@ def detect_brand(text: str) -> Optional[str]:
     return None
 
 
+_WATCH_RE = re.compile(r"\b(watch(?:es)?|wristwatch(?:es)?|montre|timepiece|horloge)\b", re.IGNORECASE)
+
+def is_watch_lot(*texts: str) -> bool:
+    """Return True if any of the provided text fields mention a watch/wristwatch.
+    Used to filter auction lots so non-watch lots (coins, art, marbles…) that
+    happen to contain 'journe' or 'bethune' are excluded."""
+    return any(_WATCH_RE.search(t) for t in texts if t)
+
+
 def make_session() -> requests.Session:
     s = requests.Session()
     s.headers.update(HEADERS)
@@ -1199,6 +1208,8 @@ def scrape_phillips(session: requests.Session) -> list[AuctionLot]:
 
             maker   = lot.get("makerName", "")
             model   = lot.get("wModelName", "")
+            if not is_watch_lot(maker, model, lot.get("description", "")):
+                continue
             title   = f"{maker} {model}".strip()
 
             low     = lot.get("lowEstimate", 0)
@@ -1642,6 +1653,8 @@ def scrape_sothebys(session: requests.Session) -> list[AuctionLot]:
                 continue
 
             title    = h.get("title") or "Unknown"
+            if not is_watch_lot(title, h.get("description", ""), h.get("subtitle", "")):
+                continue
             currency = h.get("currency", "USD")
             sign     = "$" if currency == "USD" else currency
 
@@ -1929,6 +1942,8 @@ def scrape_christies(session: requests.Session) -> list[AuctionLot]:
                     for h in hits:
                         if not detect_brand(f"{h.get('title','')} {h.get('object_name','')} {h.get('maker','')} {kw}"):
                             continue
+                        if not is_watch_lot(h.get('title',''), h.get('object_name',''), h.get('description','')):
+                            continue
                         lot = _christies_parse_lot(h, brand)
                         if lot:
                             page_lots.append(lot)
@@ -2111,6 +2126,8 @@ def scrape_invaluable(session: requests.Session) -> list[AuctionLot]:
 
                     title = h.get("lotTitle") or ""
                     if not brand_re.search(title):
+                        continue
+                    if not is_watch_lot(title, h.get("description", "")):
                         continue
 
                     seen_refs.add(lot_ref)
@@ -2329,6 +2346,8 @@ def scrape_antiquorum(session: requests.Session) -> list[AuctionLot]:
                         break
                 if not matched_brand:
                     continue
+                if not is_watch_lot(title_text):
+                    continue
 
                 seen_urls.add(href)
                 lot_url = CATALOG_BASE + href
@@ -2473,6 +2492,9 @@ def scrape_barnebys(session: requests.Session) -> list[AuctionLot]:
                     or next((v.get("title") for v in i18n.values() if isinstance(v, dict) and v.get("title")), None)
                     or "Unknown"
                 )
+
+                if not is_watch_lot(title):
+                    continue
 
                 # Image
                 img = h.get("img") or ""
@@ -2667,6 +2689,8 @@ def scrape_liveauctioneers(session: requests.Session) -> list[AuctionLot]:
 
                 title = h.get("title") or ""
                 if not brand_re.search(title):
+                    continue
+                if not is_watch_lot(title, h.get("shortDescription", "")):
                     continue
                 if h.get("isSold") or h.get("catalogStatus") in ("done", "archive", "passed"):
                     continue
