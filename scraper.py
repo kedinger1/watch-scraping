@@ -1603,36 +1603,41 @@ def scrape_sothebys(session: requests.Session) -> list[AuctionLot]:
 
     for brand, creator_slug, search_q in queries:
         hits: list[dict] = []
+        def _extract_hits(nd: dict) -> list[dict]:
+            """Try all known __NEXT_DATA__ paths to find Algolia hits."""
+            pp = nd.get("props", {}).get("pageProps", {})
+            # Path 1: auction lot page — algoliaJson.hits (confirmed Apr 2026)
+            h = pp.get("algoliaJson", {}).get("hits")
+            if h:
+                return h
+            # Path 2: creator page — resultsState.rawResults[0].hits
+            rs = pp.get("resultsState", {})
+            h = rs.get("rawResults", [{}])[0].get("hits", [])
+            if h:
+                return h
+            # Path 3: search page — results.hits
+            h = pp.get("results", {}).get("hits", [])
+            return h
+
         if creator_slug:
-            url = f"{BASE}/en/buy/luxury/watches/watch/{creator_slug}?waysToBuy=bid"
+            url = f"{BASE}/en/buy/auction/2026/important-watches-4?creators%5B0%5D={quote_plus('F.P. Journe')}&lotFilter=AllLots" if brand == "FP Journe" else f"{BASE}/en/buy/luxury/watches/watch/{creator_slug}?waysToBuy=bid"
             resp = fetch(url, session)
             if resp and resp.status_code == 200:
-                m = re.search(
-                    r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>',
-                    resp.text, re.DOTALL,
-                )
+                m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', resp.text, re.DOTALL)
                 if m:
                     try:
-                        nd  = json.loads(m.group(1))
-                        pp  = nd.get("props", {}).get("pageProps", {})
-                        rs  = pp.get("resultsState", {})
-                        hits = rs.get("rawResults", [{}])[0].get("hits", [])
+                        hits = _extract_hits(json.loads(m.group(1)))
                     except Exception as exc:
-                        log.warning("Sotheby's %s creator-page JSON error: %s", brand, exc)
+                        log.warning("Sotheby's %s page JSON error: %s", brand, exc)
 
         if not hits and search_q:
             url = f"{BASE}/en/search?query={quote_plus(search_q)}"
             resp = fetch(url, session)
             if resp:
-                m = re.search(
-                    r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>',
-                    resp.text, re.DOTALL,
-                )
+                m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', resp.text, re.DOTALL)
                 if m:
                     try:
-                        nd  = json.loads(m.group(1))
-                        pp  = nd.get("props", {}).get("pageProps", {})
-                        hits = pp.get("results", {}).get("hits", [])
+                        hits = _extract_hits(json.loads(m.group(1)))
                     except Exception as exc:
                         log.warning("Sotheby's %s search-page JSON error: %s", brand, exc)
 
@@ -1669,7 +1674,8 @@ def scrape_sothebys(session: requests.Session) -> list[AuctionLot]:
             if lot_path.startswith("http"):
                 lot_url = lot_path
             elif lot_path:
-                lot_url = f"{BASE}/en/{lot_path.lstrip('/')}"
+                # slug already includes /en/ prefix e.g. "/en/buy/auction/..."
+                lot_url = BASE + lot_path if lot_path.startswith("/") else f"{BASE}/{lot_path}"
             else:
                 lot_url = url
 
@@ -1686,16 +1692,17 @@ def scrape_sothebys(session: requests.Session) -> list[AuctionLot]:
                     sale_date_cache[sale_slug] = _sothebys_sale_dates(session, sale_slug, BASE)
                 sale_date, sale_date_end = sale_date_cache[sale_slug]
 
-            location   = h.get("saleLocation") or h.get("location") or h.get("auctionLocation") or "Sotheby's"
-            sale_name  = h.get("saleName") or h.get("sale_name") or "Sotheby's Watch Sale"
-            lot_number = str(h.get("lotNumber") or h.get("lot_number") or h.get("lotNr") or "")
+            location   = h.get("auctionLocation") or h.get("saleLocation") or h.get("location") or "Sotheby's"
+            sale_name  = h.get("auctionName") or h.get("saleName") or h.get("sale_name") or "Sotheby's Watch Sale"
+            lot_number = str(h.get("lotDisplayNumber") or h.get("lotNr") or h.get("lotNumber") or h.get("lot_number") or "")
+            _obj_id    = h.get("objectID") or h.get("objectId") or ""
             _imgs      = h.get("images") or []
             image_url  = (
                 h.get("imageUrl")
                 or h.get("image_url")
                 or h.get("image")
                 or (_imgs[0] if isinstance(_imgs, list) and _imgs else None)
-                or ""
+                or (f"https://dam.sothebys.com/dam/image/lot/{_obj_id}/primary/medium" if _obj_id else "")
             )
 
             lots.append(AuctionLot(
