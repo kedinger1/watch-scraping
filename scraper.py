@@ -2167,7 +2167,10 @@ def scrape_invaluable(session: requests.Session) -> list[AuctionLot]:
                     lot_url = f"{BASE}/auction-lot/{title_slug}-{lot_number}-c-{lot_ref.lower()}"
 
                     # Image
-                    photo_path = h.get("photoPath") or ""
+                    photo_path = h.get("photoPath") or h.get("photo") or h.get("image") or ""
+                    if not photo_path and not lots:  # log first miss once
+                        log.info("Invaluable img fields: photoPath=%r photo=%r image=%r photos=%r",
+                                 h.get("photoPath"), h.get("photo"), h.get("image"), h.get("photos"))
                     image_url  = f"{IMG_BASE}/{photo_path}" if photo_path else ""
 
                     house_name = h.get("houseName") or "Invaluable"
