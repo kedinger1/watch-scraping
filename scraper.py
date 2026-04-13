@@ -1620,7 +1620,8 @@ def scrape_sothebys(session: requests.Session) -> list[AuctionLot]:
             return h
 
         if creator_slug:
-            url = f"{BASE}/en/buy/auction/2026/important-watches-4?creators%5B0%5D={quote_plus('F.P. Journe')}&lotFilter=AllLots" if brand == "FP Journe" else f"{BASE}/en/buy/luxury/watches/watch/{creator_slug}?waysToBuy=bid"
+            # Creator page lists all upcoming auction lots across all sales dynamically
+            url = f"{BASE}/en/buy/luxury/watches/watch/{creator_slug}?waysToBuy=bid"
             resp = fetch(url, session)
             if resp and resp.status_code == 200:
                 m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', resp.text, re.DOTALL)
