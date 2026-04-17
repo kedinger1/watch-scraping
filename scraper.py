@@ -236,10 +236,14 @@ def scrape_chrono24(session: requests.Session) -> list[Listing]:
                 title = " ".join(parts)
                 break
 
-        price = next(
-            (t for t in texts if "$" in t and any(c.isdigit() for c in t)),
-            next((t for t in texts if "price on request" in t.lower()), "—"),
-        )
+        if any("price on request" in t.lower() for t in texts):
+            price = "Price on Request"
+        else:
+            price = next(
+                (t for t in texts if "$" in t and any(c.isdigit() for c in t)
+                 and "ship" not in t.lower() and "deliver" not in t.lower()),
+                "—",
+            )
 
         listings.append(Listing(
             title=title,
