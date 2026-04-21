@@ -1415,10 +1415,19 @@ def save_to_supabase(listings: list[Listing]) -> None:
     )
 
 
-def save_auction_lots_to_supabase(lots: list[AuctionLot]) -> None:
+def save_auction_lots_to_supabase(
+    lots: list[AuctionLot],
+    successful_houses: Optional[set[str]] = None,
+) -> None:
     """
     Upsert auction lots to the auction_lots table and mark any
     previously-upcoming lots not seen this run as inactive (is_upcoming=false).
+
+    successful_houses: set of auction_house names whose scrapers returned
+    results this run (even if 0 lots — but only houses that didn't raise an
+    exception).  Stale-marking is limited to these houses so a scraper failure
+    doesn't nuke previously-saved lots from that source.
+    If None, stale-marking covers all houses (legacy behaviour).
     """
     url_env = os.environ.get("SUPABASE_URL", "")
     key_env = os.environ.get("SUPABASE_KEY", "")
@@ -1441,20 +1450,20 @@ def save_auction_lots_to_supabase(lots: list[AuctionLot]) -> None:
     from datetime import datetime, timezone
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    # Fetch existing upcoming lots so we can mark stale ones inactive
+    # Fetch existing upcoming lots so we can mark stale ones inactive.
+    # Only consider lots from houses that ran without exception this cycle.
     try:
-        existing_resp = (
-            sb.table("auction_lots")
-            .select("lot_url, is_upcoming")
-            .eq("is_upcoming", True)
-            .execute()
-        )
-        existing_upcoming: set[str] = {
-            row["lot_url"] for row in (existing_resp.data or [])
-        }
+        q = sb.table("auction_lots").select("lot_url,auction_house").eq("is_upcoming", True)
+        existing_resp = q.execute()
+        existing_rows = existing_resp.data or []
     except Exception as exc:
         log.error("Supabase fetch existing auction_lots failed: %s", exc)
-        existing_upcoming = set()
+        existing_rows = []
+
+    # Build a map of url → house for all currently-upcoming lots
+    existing_upcoming: dict[str, str] = {
+        row["lot_url"]: row.get("auction_house", "") for row in existing_rows
+    }
 
     seen_urls: set[str] = set()
 
@@ -1496,8 +1505,15 @@ def save_auction_lots_to_supabase(lots: list[AuctionLot]) -> None:
             log.warning("Supabase upsert auction lot failed for %s: %s",
                         lot.lot_url[:60], exc)
 
-    # Mark lots that disappeared from the live feed as no longer upcoming
-    stale = [u for u in existing_upcoming if u not in seen_urls]
+    # Mark lots that disappeared from the live feed as no longer upcoming.
+    # Only mark stale for houses whose scraper ran without raising an exception;
+    # if a house scraper errored out we leave its lots intact rather than
+    # incorrectly nuking them.
+    stale = [
+        url for url, house in existing_upcoming.items()
+        if url not in seen_urls
+        and (successful_houses is None or house in successful_houses)
+    ]
     if stale:
         try:
             (
@@ -3868,17 +3884,19 @@ if __name__ == "__main__":
         session.headers.update(HEADERS)
         all_auction_lots: list[AuctionLot] = []
         all_stats: list[dict] = []
+        successful_houses: set[str] = set()
         for house, fn in [("Phillips", scrape_phillips), ("Sotheby's", scrape_sothebys), ("Christie's", scrape_christies), ("Barnebys", scrape_barnebys), ("LiveAuctioneers", scrape_liveauctioneers), ("Invaluable", scrape_invaluable), ("Antiquorum", scrape_antiquorum)]:
             log.info("── Scraping %s (auction lots) …", house)
             try:
                 lots = fn(session)
                 all_auction_lots.extend(lots)
+                successful_houses.add(house)
                 all_stats.append({"source": house, "count": len(lots), "status": "ok", "error": None})
                 log.info("%s: %d lot(s)", house, len(lots))
             except Exception as exc:
                 log.error("%s scraper failed: %s", house, exc)
                 all_stats.append({"source": house, "count": 0, "status": "failed", "error": str(exc)})
-        save_auction_lots_to_supabase(all_auction_lots)
+        save_auction_lots_to_supabase(all_auction_lots, successful_houses=successful_houses)
         n_new_alerts  = send_auction_alerts()
         n_close_alerts = send_auction_close_reminders()
         log.info("Auction alerts: %d new sale alert(s), %d close reminder(s) sent",
