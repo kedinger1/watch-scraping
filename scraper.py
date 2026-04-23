@@ -46,6 +46,9 @@ RESEND_FROM = os.environ.get("RESEND_FROM", "Watch Monitor <watch@1916co.com>")
 RECIPIENT       = os.environ.get("RECIPIENT_EMAIL", "you@1916co.com")
 ALERT_RECIPIENT = os.environ.get("ALERT_RECIPIENT") or RECIPIENT  # direct recipient for auction alerts
 
+# Sellers to exclude — our own inventory shows up on Chrono24/eBay and adds noise
+EXCLUDED_SELLERS = {"1916 company", "1916co", "the1916company"}
+
 # How many result pages to fetch per brand per site (Chrono24 / eBay)
 MAX_PAGES = 3
 
@@ -236,6 +239,11 @@ def scrape_chrono24(session: requests.Session) -> list[Listing]:
                 title = " ".join(parts)
                 break
 
+        # Skip our own inventory — The 1916 Company dealer name appears in card text
+        card_text_lower = " ".join(texts).lower()
+        if any(s in card_text_lower for s in EXCLUDED_SELLERS):
+            continue
+
         if any("price on request" in t.lower() for t in texts):
             price = "Price on Request"
         else:
@@ -335,6 +343,11 @@ def scrape_ebay(session: requests.Session) -> list[Listing]:
                 break
 
             for item in items:
+                # Skip our own inventory
+                seller_name = (item.get("seller", {}).get("username", "") or "").lower()
+                if any(s in seller_name for s in EXCLUDED_SELLERS):
+                    continue
+
                 price_val = item.get("price", {})
                 try:
                     price = f"${float(price_val.get('value', 0)):,.0f}"
