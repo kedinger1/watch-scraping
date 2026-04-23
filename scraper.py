@@ -47,7 +47,9 @@ RECIPIENT       = os.environ.get("RECIPIENT_EMAIL", "you@1916co.com")
 ALERT_RECIPIENT = os.environ.get("ALERT_RECIPIENT") or RECIPIENT  # direct recipient for auction alerts
 
 # Sellers to exclude — our own inventory shows up on Chrono24/eBay and adds noise
-EXCLUDED_SELLERS = {"1916 company", "1916co", "the1916company"}
+# eBay: seller.username (from ebay.com/str/the1916company)
+# Chrono24: dealer name appears in card text
+EXCLUDED_SELLERS = {"1916 company", "the 1916 company", "the1916company"}
 
 # How many result pages to fetch per brand per site (Chrono24 / eBay)
 MAX_PAGES = 3
