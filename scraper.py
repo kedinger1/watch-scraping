@@ -48,8 +48,8 @@ ALERT_RECIPIENT = os.environ.get("ALERT_RECIPIENT") or RECIPIENT  # direct recip
 
 # Sellers to exclude — our own inventory shows up on Chrono24/eBay and adds noise
 # eBay: seller.username (from ebay.com/str/the1916company)
-# Chrono24: dealer name appears in card text
-EXCLUDED_SELLERS = {"1916 company", "the 1916 company", "the1916company"}
+# Chrono24: dealer name appears in card text; 1916 Co operates under The Watch Box slug
+EXCLUDED_SELLERS = {"1916 company", "the 1916 company", "the1916company", "watchbox", "the watch box"}
 
 # How many result pages to fetch per brand per site (Chrono24 / eBay)
 MAX_PAGES = 3
