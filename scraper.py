@@ -2805,23 +2805,16 @@ def deduplicate(listings: list[Listing]) -> list[Listing]:
 
 
 # ── Cross-platform deduplication ──────────────────────────────────────────────
-_REF_RE = re.compile(r"\b([A-Z]{1,5}\d[A-Z0-9\-]{2,})\b")
-
-def _extract_refs(title: str) -> set[str]:
-    """Extract watch reference-number-like tokens from a title (e.g. DB28XPTB, FPJ-39-RG)."""
-    return set(_REF_RE.findall(title))
-
-
 def cross_platform_dedup(listings: list[Listing]) -> list[Listing]:
     """
-    Collapse listings that appear on multiple platforms into a single row.
-
-    Two listings are considered duplicates if they share the same brand+price AND:
-      - their normalized titles match, OR
-      - they share at least one reference-number token (e.g. DB28XPTB)
+    Collapse listings that appear on multiple platforms with identical
+    brand + price + normalized title into a single row.
 
     The first-seen listing is kept; subsequent duplicates are dropped and
     their source names are added to the kept listing's `also_on` list.
+
+    Normalization: lowercase, collapse whitespace, strip punctuation noise
+    so minor formatting differences don't prevent matching.
     """
     def norm(s: str) -> str:
         s = s.lower().strip()
@@ -2829,36 +2822,19 @@ def cross_platform_dedup(listings: list[Listing]) -> list[Listing]:
         s = re.sub(r"\s+", " ", s)
         return s
 
-    # Two indexes: title-based and ref-based, both keyed by (brand, price, <token>)
-    title_seen: dict[tuple, Listing] = {}
-    ref_seen:   dict[tuple, Listing] = {}
+    # Key: (brand, normalized_title, price)
+    seen: dict[tuple, Listing] = {}
     out: list[Listing] = []
 
-    def _mark_duplicate(lst: Listing, kept: Listing) -> None:
-        if lst.source not in kept.also_on and lst.source != kept.source:
-            kept.also_on.append(lst.source)
-
     for lst in listings:
-        title_key = (lst.brand, norm(lst.title), lst.price)
-        refs = _extract_refs(lst.title)
-        ref_keys = [(lst.brand, ref, lst.price) for ref in refs]
-
-        # Check title match first
-        if title_key in title_seen:
-            _mark_duplicate(lst, title_seen[title_key])
-            continue
-
-        # Check ref-number match
-        matched = next((ref_seen[k] for k in ref_keys if k in ref_seen), None)
-        if matched is not None:
-            _mark_duplicate(lst, matched)
-            continue
-
-        # New unique listing — register in both indexes
-        title_seen[title_key] = lst
-        for k in ref_keys:
-            ref_seen[k] = lst
-        out.append(lst)
+        key = (lst.brand, norm(lst.title), lst.price)
+        if key in seen:
+            kept = seen[key]
+            if lst.source not in kept.also_on and lst.source != kept.source:
+                kept.also_on.append(lst.source)
+        else:
+            seen[key] = lst
+            out.append(lst)
 
     dupes = len(listings) - len(out)
     if dupes:
