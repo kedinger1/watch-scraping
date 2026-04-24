@@ -241,9 +241,15 @@ def scrape_chrono24(session: requests.Session) -> list[Listing]:
                 title = " ".join(parts)
                 break
 
-        # Skip our own inventory — The 1916 Company dealer name appears in card text
         card_text_lower = " ".join(texts).lower()
+
+        # Skip our own inventory — The 1916 Company dealer name appears in card text
         if any(s in card_text_lower for s in EXCLUDED_SELLERS):
+            continue
+
+        # Skip auction listings — already covered by dedicated auction scrapers
+        if "auction" in card_text_lower:
+            log.debug("Chrono24: skipping auction listing %s", listing_url)
             continue
 
         if any("price on request" in t.lower() for t in texts):
