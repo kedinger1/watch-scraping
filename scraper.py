@@ -3538,24 +3538,28 @@ def _build_alert_email(
     location: str,
     sale_date: str,
     sale_date_end: str,
-    fpj_lots: list[dict],
-    db_lots: list[dict],
+    lots_by_brand: dict[str, list[dict]],
     close_reminder: bool = False,
 ) -> tuple[str, str, str]:
     """
     Build subject + plain + HTML for a single sale-event alert.
 
-    fpj_lots / db_lots are raw Supabase row dicts (keys: title, estimate_low,
-    estimate_high, currency, lot_url, image_url, lot_number, brand).
+    lots_by_brand maps brand key → list of raw Supabase row dicts
+    (keys: title, estimate_low, estimate_high, currency, lot_url,
+     image_url, lot_number, brand).
     """
-    n_fpj = len(fpj_lots)
-    n_db  = len(db_lots)
-    total = n_fpj + n_db
+    fpj_lots = lots_by_brand.get("FP Journe", [])
+    db_lots  = lots_by_brand.get("De Bethune", [])
+    gf_lots  = lots_by_brand.get("Greubel Forsey", [])
+    dr_lots  = lots_by_brand.get("Daniel Roth", [])
+    total = sum(len(v) for v in lots_by_brand.values())
 
-    # Brand pill summary e.g. "15 FPJ · 1 DB"
+    # Brand pill summary e.g. "15 FPJ · 1 DB · 2 GF"
     pills = " · ".join(filter(None, [
-        f"{n_fpj} FPJ" if n_fpj else "",
-        f"{n_db} DB"   if n_db  else "",
+        f"{len(fpj_lots)} FPJ" if fpj_lots else "",
+        f"{len(db_lots)} DB"   if db_lots  else "",
+        f"{len(gf_lots)} GF"   if gf_lots  else "",
+        f"{len(dr_lots)} DR"   if dr_lots  else "",
     ]))
 
     # Date range display
@@ -3590,10 +3594,17 @@ def _build_alert_email(
             return f"{sign}{int(low or high):,}"
         return "—"
 
+    _BRAND_COLORS = {
+        "F.P. Journe":    "#1a3550",
+        "De Bethune":     "#3a1a55",
+        "Greubel Forsey": "#1a4a1a",
+        "Daniel Roth":    "#4a2a1a",
+    }
+
     def _lot_rows_html(lots: list[dict], brand_label: str) -> str:
         if not lots:
             return ""
-        header_color = "#1a3550" if brand_label == "F.P. Journe" else "#3a1a55"
+        header_color = _BRAND_COLORS.get(brand_label, "#1a3550")
         rows_html = ""
         for row in lots:
             est    = _fmt_estimate(row)
@@ -3664,6 +3675,8 @@ def _build_alert_email(
         plain_lines.insert(0, "⚠ This sale closes soon.\n")
     plain_lines += _lot_rows_plain(fpj_lots, "F.P. Journe")
     plain_lines += _lot_rows_plain(db_lots, "De Bethune")
+    plain_lines += _lot_rows_plain(gf_lots, "Greubel Forsey")
+    plain_lines += _lot_rows_plain(dr_lots, "Daniel Roth")
     plain = "\n".join(plain_lines)
 
     # ── HTML ──────────────────────────────────────────────────────────────────
@@ -3697,6 +3710,8 @@ def _build_alert_email(
 
   {_lot_rows_html(fpj_lots, "F.P. Journe")}
   {_lot_rows_html(db_lots, "De Bethune")}
+  {_lot_rows_html(gf_lots, "Greubel Forsey")}
+  {_lot_rows_html(dr_lots, "Daniel Roth")}
 
   <div style="margin-top:36px;padding-top:16px;border-top:1px solid #e8e8e8;font-size:12px;color:#bbb;">
     <a href="https://auctionmonitoring.netlify.app"
@@ -3782,8 +3797,10 @@ def send_auction_alerts() -> int:
     now_iso = datetime.now(timezone.utc).isoformat()
 
     for (auction_house, sale_name), lot_rows in groups.items():
-        fpj_lots = [r for r in lot_rows if r.get("brand") == "FP Journe"]
-        db_lots  = [r for r in lot_rows if r.get("brand") == "De Bethune"]
+        lots_by_brand = {
+            b: [r for r in lot_rows if r.get("brand") == b]
+            for b in BRANDS
+        }
 
         # Pick representative location / dates from the group
         location     = next((r["location"]     for r in lot_rows if r.get("location")),     "")
@@ -3809,8 +3826,7 @@ def send_auction_alerts() -> int:
             location=location,
             sale_date=sale_date_display,
             sale_date_end=sale_date_end_display,
-            fpj_lots=fpj_lots,
-            db_lots=db_lots,
+            lots_by_brand=lots_by_brand,
             close_reminder=False,
         )
 
@@ -3908,8 +3924,10 @@ def send_auction_close_reminders() -> int:
     now_iso = now_utc.isoformat()
 
     for (auction_house, sale_name), lot_rows in groups.items():
-        fpj_lots = [r for r in lot_rows if r.get("brand") == "FP Journe"]
-        db_lots  = [r for r in lot_rows if r.get("brand") == "De Bethune"]
+        lots_by_brand = {
+            b: [r for r in lot_rows if r.get("brand") == b]
+            for b in BRANDS
+        }
 
         location      = next((r["location"]      for r in lot_rows if r.get("location")),      "")
         sale_date_raw  = next((r["sale_date"]     for r in lot_rows if r.get("sale_date")),     "")
@@ -3930,8 +3948,7 @@ def send_auction_close_reminders() -> int:
             location=location,
             sale_date=_fmt_date(sale_date_raw),
             sale_date_end=_fmt_date(sale_date_end),
-            fpj_lots=fpj_lots,
-            db_lots=db_lots,
+            lots_by_brand=lots_by_brand,
             close_reminder=True,
         )
 
