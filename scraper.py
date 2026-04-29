@@ -3722,13 +3722,16 @@ def _build_alert_email(
   {_lot_rows_html(gf_lots, "Greubel Forsey")}
   {_lot_rows_html(dr_lots, "Daniel Roth")}
 
-  <div style="margin-top:36px;padding-top:16px;border-top:1px solid #e8e8e8;font-size:12px;color:#bbb;">
+  <div style="margin-top:36px;padding-top:20px;border-top:1px solid #e8e8e8;">
     <a href="https://auctionmonitoring.netlify.app"
-       style="color:#888;text-decoration:none;">View all upcoming auctions &rarr;</a><br>
-    <span style="font-size:11px;">
+       style="display:inline-block;background:#1a3550;color:#fff;font-size:14px;
+              font-weight:600;text-decoration:none;padding:10px 20px;border-radius:6px;">
+      View all upcoming auctions &rarr;
+    </a>
+    <p style="margin:12px 0 0;font-size:11px;color:#bbb;">
       Monitored: Phillips &middot; Sotheby&rsquo;s &middot; Christie&rsquo;s &middot;
       Loupe This &middot; Invaluable &middot; Barnebys &middot; LiveAuctioneers &middot; Antiquorum
-    </span>
+    </p>
   </div>
 
 </body>
