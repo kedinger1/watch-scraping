@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 Watch Listing Monitor
-Scrapes pre-owned F.P. Journe and De Bethune listings from major watch
-marketplaces and sends a daily digest email with photos, titles, prices,
-and source links.
+Scrapes pre-owned F.P. Journe, De Bethune, Greubel Forsey, and Daniel Roth
+listings from major watch marketplaces and sends a daily digest email with
+photos, titles, prices, and source links.
 
 Environment variables required:
   RESEND_API_KEY    — Resend.com API key
@@ -75,7 +75,7 @@ class Listing:
     image_url: str
     listing_url: str
     source: str
-    brand: str  # "FP Journe" | "De Bethune"
+    brand: str  # "FP Journe" | "De Bethune" | "Greubel Forsey" | "Daniel Roth"
     reference_number: str = ""        # e.g. "FPJ-39-RG" — populated where available
     first_seen_at: str = ""           # "Apr 6, 2026" — populated from Supabase after upsert
     also_on: list[str] = field(default_factory=list)  # other sources carrying same watch
@@ -93,7 +93,7 @@ class AuctionLot:
     sale_location: str              # "New York" | "Geneva" | "Online"
     image_url: str
     lot_url: str
-    brand: str                      # "FP Journe" | "De Bethune"
+    brand: str                      # "FP Journe" | "De Bethune" | "Greubel Forsey" | "Daniel Roth"
     auction_house: str = "Phillips"
     sale_name: str = ""             # "Important Watches, New York"
     lot_number: str = ""
@@ -105,13 +105,21 @@ class AuctionLot:
 
 
 def detect_brand(text: str) -> Optional[str]:
-    """Return 'FP Journe' or 'De Bethune' if the text matches, else None."""
+    """Return brand key if the text matches one of the monitored brands, else None."""
     t = text.lower()
     if "journe" in t:
         return "FP Journe"
     if "bethune" in t or "de bethune" in t:
         return "De Bethune"
+    if "greubel" in t or "greubel forsey" in t:
+        return "Greubel Forsey"
+    if "daniel roth" in t:
+        return "Daniel Roth"
     return None
+
+
+# Canonical list of monitored brands — order controls email send order
+BRANDS: list[str] = ["FP Journe", "De Bethune", "Greubel Forsey", "Daniel Roth"]
 
 
 _WATCH_RE = re.compile(r"\b(watch(?:es)?|wristwatch(?:es)?|montre|timepiece|horloge)\b", re.IGNORECASE)
@@ -170,7 +178,6 @@ def scrape_chrono24(session: requests.Session) -> list[Listing]:
     Chrono24 uses Cloudflare bot protection — GitHub Actions datacenter IPs are
     blocked at IP-reputation level regardless of browser stealth.
 
-    Only De Bethune is scraped (~100 listings, mostly real held inventory).
     FP Journe is intentionally excluded — ~900 listings of which ~70% are broker
     placeholders with no held stock (per internal intel).
 
@@ -179,7 +186,6 @@ def scrape_chrono24(session: requests.Session) -> list[Listing]:
     listing cards, so no Playwright is needed — plain requests + BeautifulSoup.
     Credentials read from BRIGHT_DATA_PROXY env var.
 
-    URL:      /debethune/index.htm (brand page, up to 120 listings)
     Selector: .js-listing-item-link
     """
     proxy_url = os.environ.get("BRIGHT_DATA_PROXY", "")
@@ -188,89 +194,98 @@ def scrape_chrono24(session: requests.Session) -> list[Listing]:
 
     proxies = {"http": proxy_url, "https": proxy_url}
     BASE = "https://www.chrono24.com"
-    url = f"{BASE}/debethune/index.htm?dosearch=true&query=de+bethune"
 
-    try:
-        resp = session.get(url, proxies=proxies, verify=False, timeout=30)
-        resp.raise_for_status()
-    except Exception as exc:
-        raise RuntimeError(f"Chrono24 request failed: {exc}") from exc
+    # (brand, brand_page_slug, search_query)
+    # FP Journe excluded intentionally (see docstring)
+    brand_configs = [
+        ("De Bethune",     "debethune",     "de+bethune"),
+        ("Greubel Forsey", "greubelforsey", "greubel+forsey"),
+        ("Daniel Roth",    "danielroth",    "daniel+roth"),
+    ]
 
-    soup = BeautifulSoup(resp.text, "lxml")
-    cards = soup.select(".js-listing-item-link")
-    log.info("Chrono24 De Bethune: %d listing cards", len(cards))
+    all_listings: list[Listing] = []
 
-    if not cards:
-        # Check if we hit a challenge page
-        title = soup.title.string if soup.title else ""
-        if "moment" in title.lower() or "cloudflare" in title.lower():
-            raise RuntimeError(f"Blocked by Cloudflare ({title!r})")
-        raise RuntimeError("No listing cards found — page structure may have changed")
-
-    listings: list[Listing] = []
-    for a in cards:
-        href = a.get("href", "")
-        if not href:
+    for brand, slug, query in brand_configs:
+        url = f"{BASE}/{slug}/index.htm?dosearch=true&query={query}"
+        try:
+            resp = session.get(url, proxies=proxies, verify=False, timeout=30)
+            resp.raise_for_status()
+        except Exception as exc:
+            log.warning("Chrono24 %s request failed: %s", brand, exc)
             continue
-        listing_url = href if href.startswith("http") else BASE + href
 
-        card = a.find_parent(class_=re.compile(r"wt-search-result|listing-item|js-listing-item")) or a
-        img_tag = card.find("img")
-        # Chrono24 lazy-loads via data-lazy-sweet-spot-master-src with _SIZE_ placeholder
-        img_url = ""
-        if img_tag:
-            sweet = img_tag.get("data-lazy-sweet-spot-master-src", "")
-            if sweet:
-                img_url = sweet.replace("_SIZE_", "220")
+        soup = BeautifulSoup(resp.text, "lxml")
+        cards = soup.select(".js-listing-item-link")
+        log.info("Chrono24 %s: %d listing cards", brand, len(cards))
+
+        if not cards:
+            page_title = soup.title.string if soup.title else ""
+            if "moment" in page_title.lower() or "cloudflare" in page_title.lower():
+                log.warning("Chrono24 %s: Blocked by Cloudflare (%r)", brand, page_title)
+            continue
+
+        for a in cards:
+            href = a.get("href", "")
+            if not href:
+                continue
+            listing_url = href if href.startswith("http") else BASE + href
+
+            card = a.find_parent(class_=re.compile(r"wt-search-result|listing-item|js-listing-item")) or a
+            img_tag = card.find("img")
+            img_url = ""
+            if img_tag:
+                sweet = img_tag.get("data-lazy-sweet-spot-master-src", "")
+                if sweet:
+                    img_url = sweet.replace("_SIZE_", "220")
+                else:
+                    img_url = best_img(img_tag)
+                    img_url = img_url.replace("-Square28.", "-Square40.") if img_url else ""
+
+            texts = [el.get_text(" ", strip=True) for el in card.find_all(string=True, recursive=True)
+                     if el.get_text(strip=True)]
+            texts = [t for t in texts if len(t) > 1]
+
+            title = "Unknown"
+            for i, t in enumerate(texts):
+                if detect_brand(t):
+                    parts = [t]
+                    if i + 1 < len(texts):
+                        nxt = texts[i + 1]
+                        if "$" not in nxt and "price" not in nxt.lower() and len(nxt) > 3:
+                            parts.append(nxt)
+                    title = " ".join(parts)
+                    break
+
+            card_text_lower = " ".join(texts).lower()
+
+            # Skip our own inventory
+            if any(s in card_text_lower for s in EXCLUDED_SELLERS):
+                continue
+
+            # Skip auction listings — already covered by dedicated auction scrapers
+            if "auction" in card_text_lower:
+                log.debug("Chrono24: skipping auction listing %s", listing_url)
+                continue
+
+            if any("price on request" in t.lower() for t in texts):
+                price = "Price on Request"
             else:
-                img_url = best_img(img_tag)
-                img_url = img_url.replace("-Square28.", "-Square40.") if img_url else ""
+                price = next(
+                    (t for t in texts if "$" in t and any(c.isdigit() for c in t)
+                     and "ship" not in t.lower() and "deliver" not in t.lower()),
+                    "—",
+                )
 
-        texts = [el.get_text(" ", strip=True) for el in card.find_all(string=True, recursive=True)
-                 if el.get_text(strip=True)]
-        texts = [t for t in texts if len(t) > 1]
+            all_listings.append(Listing(
+                title=title,
+                price=price,
+                image_url=img_url,
+                listing_url=listing_url,
+                source="Chrono24",
+                brand=brand,
+            ))
 
-        title = "Unknown"
-        for i, t in enumerate(texts):
-            if detect_brand(t):
-                parts = [t]
-                if i + 1 < len(texts):
-                    nxt = texts[i + 1]
-                    if "$" not in nxt and "price" not in nxt.lower() and len(nxt) > 3:
-                        parts.append(nxt)
-                title = " ".join(parts)
-                break
-
-        card_text_lower = " ".join(texts).lower()
-
-        # Skip our own inventory — The 1916 Company dealer name appears in card text
-        if any(s in card_text_lower for s in EXCLUDED_SELLERS):
-            continue
-
-        # Skip auction listings — already covered by dedicated auction scrapers
-        if "auction" in card_text_lower:
-            log.debug("Chrono24: skipping auction listing %s", listing_url)
-            continue
-
-        if any("price on request" in t.lower() for t in texts):
-            price = "Price on Request"
-        else:
-            price = next(
-                (t for t in texts if "$" in t and any(c.isdigit() for c in t)
-                 and "ship" not in t.lower() and "deliver" not in t.lower()),
-                "—",
-            )
-
-        listings.append(Listing(
-            title=title,
-            price=price,
-            image_url=img_url,
-            listing_url=listing_url,
-            source="Chrono24",
-            brand="De Bethune",
-        ))
-
-    return deduplicate(listings)
+    return deduplicate(all_listings)
 
 
 # ── eBay ───────────────────────────────────────────────────────────────────────
@@ -321,8 +336,10 @@ def scrape_ebay(session: requests.Session) -> list[Listing]:
         "Content-Type":            "application/json",
     }
     queries = [
-        ("FP Journe",  "F.P. Journe watch"),
-        ("De Bethune", "De Bethune watch"),
+        ("FP Journe",      "F.P. Journe watch"),
+        ("De Bethune",     "De Bethune watch"),
+        ("Greubel Forsey", "Greubel Forsey watch"),
+        ("Daniel Roth",    "Daniel Roth watch"),
     ]
     for brand, query in queries:
         offset = 0
@@ -485,8 +502,10 @@ def scrape_watchfinder(session: requests.Session) -> list[Listing]:
 
     listings: list[Listing] = []
     queries = [
-        ("FP Journe",  "F.P. Journe"),
-        ("De Bethune", "De Bethune"),
+        ("FP Journe",      "F.P. Journe"),
+        ("De Bethune",     "De Bethune"),
+        ("Greubel Forsey", "Greubel Forsey"),
+        ("Daniel Roth",    "Daniel Roth"),
     ]
 
     for brand, query in queries:
@@ -623,8 +642,10 @@ def scrape_european_watch_co(session: requests.Session) -> list[Listing]:
     """
     BASE = "https://www.europeanwatch.com"
     urls = [
-        ("FP Journe",  f"{BASE}/brand/f-p-journe"),
-        ("De Bethune", f"{BASE}/search?search=de%20bethune"),
+        ("FP Journe",      f"{BASE}/brand/f-p-journe"),
+        ("De Bethune",     f"{BASE}/search?search=de%20bethune"),
+        ("Greubel Forsey", f"{BASE}/brand/greubel-forsey"),
+        ("Daniel Roth",    f"{BASE}/brand/daniel-roth"),
     ]
     listings: list[Listing] = []
 
@@ -696,8 +717,10 @@ def scrape_wristcheck(session: requests.Session) -> list[Listing]:
 
     listings: list[Listing] = []
     pages_to_visit = [
-        ("FP Journe",  "https://wristcheck.com/us/buy/f-p-journe"),
-        ("De Bethune", "https://wristcheck.com/us/buy/de-bethune"),
+        ("FP Journe",      "https://wristcheck.com/us/buy/f-p-journe"),
+        ("De Bethune",     "https://wristcheck.com/us/buy/de-bethune"),
+        ("Greubel Forsey", "https://wristcheck.com/us/buy/greubel-forsey"),
+        ("Daniel Roth",    "https://wristcheck.com/us/buy/daniel-roth"),
     ]
 
     with sync_playwright() as pw:
@@ -824,8 +847,10 @@ def scrape_bezel(session: requests.Session) -> list[Listing]:
 
     BASE = "https://shop.getbezel.com"
     explore_configs = [
-        ("FP Journe",  "fp-journe",  "F.P. Journe"),
-        ("De Bethune", "de-bethune", "De Bethune"),
+        ("FP Journe",      "fp-journe",       "F.P. Journe"),
+        ("De Bethune",     "de-bethune",      "De Bethune"),
+        ("Greubel Forsey", "greubel-forsey",  "Greubel Forsey"),
+        ("Daniel Roth",    "daniel-roth",     "Daniel Roth"),
     ]
     listings: list[Listing] = []
 
@@ -1030,8 +1055,10 @@ def scrape_1stdibs(session: requests.Session) -> list[Listing]:
 
     BASE = "https://www.1stdibs.com"
     queries = [
-        ("FP Journe",  f"{BASE}/buy/luxury-watches/?q=f.p.+journe"),
-        ("De Bethune", f"{BASE}/buy/luxury-watches/?q=de+bethune"),
+        ("FP Journe",      f"{BASE}/buy/luxury-watches/?q=f.p.+journe"),
+        ("De Bethune",     f"{BASE}/buy/luxury-watches/?q=de+bethune"),
+        ("Greubel Forsey", f"{BASE}/buy/luxury-watches/?q=greubel+forsey"),
+        ("Daniel Roth",    f"{BASE}/buy/luxury-watches/?q=daniel+roth"),
     ]
     listings: list[Listing] = []
 
@@ -1106,8 +1133,10 @@ def scrape_watches_of_switzerland(session: requests.Session) -> list[Listing]:
     listings: list[Listing] = []
     BASE = "https://www.watchesofswitzerland.com"
     queries = [
-        ("FP Journe",  f"{BASE}/search?q=fp+journe"),
-        ("De Bethune", f"{BASE}/search?q=de+bethune"),
+        ("FP Journe",      f"{BASE}/search?q=fp+journe"),
+        ("De Bethune",     f"{BASE}/search?q=de+bethune"),
+        ("Greubel Forsey", f"{BASE}/search?q=greubel+forsey"),
+        ("Daniel Roth",    f"{BASE}/search?q=daniel+roth"),
     ]
     for brand, url in queries:
         resp = fetch(url, session)
@@ -1214,8 +1243,10 @@ def scrape_phillips(session: requests.Session) -> list[AuctionLot]:
     """
     BASE = "https://www.phillips.com"
     pages = [
-        ("FP Journe",  f"{BASE}/artist/13096/f-p-journe"),
-        ("De Bethune", f"{BASE}/artist/13224/de-bethune"),
+        ("FP Journe",      f"{BASE}/artist/13096/f-p-journe"),
+        ("De Bethune",     f"{BASE}/artist/13224/de-bethune"),
+        # Greubel Forsey and Daniel Roth artist IDs not yet confirmed —
+        # add their pages here once IDs are found in phillips.com/watches
     ]
     lots: list[AuctionLot] = []
 
@@ -1635,8 +1666,10 @@ def scrape_sothebys(session: requests.Session) -> list[AuctionLot]:
     """
     BASE = "https://www.sothebys.com"
     queries = [
-        ("FP Journe",  "f-p-journe",  "f.p. journe"),
-        ("De Bethune", None,           "de bethune"),
+        ("FP Journe",      "f-p-journe",    "f.p. journe"),
+        ("De Bethune",     None,             "de bethune"),
+        ("Greubel Forsey", "greubel-forsey", "greubel forsey"),
+        ("Daniel Roth",    None,             "daniel roth"),
     ]
     lots: list[AuctionLot] = []
     # slug like "2026/important-watches-4"  →  (sale_date_str, sale_date_end_iso)
@@ -1911,8 +1944,10 @@ def scrape_christies(session: requests.Session) -> list[AuctionLot]:
     PAGE_SIZE = 30  # Christie's default page size
 
     searches = [
-        ("FP Journe",  "F.P.+Journe"),
-        ("De Bethune", "De+Bethune"),
+        ("FP Journe",      "F.P.+Journe"),
+        ("De Bethune",     "De+Bethune"),
+        ("Greubel Forsey", "Greubel+Forsey"),
+        ("Daniel Roth",    "Daniel+Roth"),
     ]
 
     lots: list[AuctionLot] = []
@@ -2082,8 +2117,10 @@ def scrape_invaluable(session: requests.Session) -> list[AuctionLot]:
     IMG_BASE = "https://image.invaluable.com/housePhotos"
 
     searches = [
-        ("FP Journe",  "fp journe"),
-        ("De Bethune", "de bethune"),
+        ("FP Journe",      "fp journe"),
+        ("De Bethune",     "de bethune"),
+        ("Greubel Forsey", "greubel forsey"),
+        ("Daniel Roth",    "daniel roth"),
     ]
 
     _brand_re = {
@@ -2479,8 +2516,10 @@ def scrape_loupethis(session: requests.Session) -> list[AuctionLot]:
 
     BASE = "https://www.loupethis.com"
     brands = [
-        ("FP Journe",  "f-p-journe"),
-        ("De Bethune", "de-bethune"),
+        ("FP Journe",      "f-p-journe"),
+        ("De Bethune",     "de-bethune"),
+        ("Greubel Forsey", "greubel-forsey"),
+        ("Daniel Roth",    "daniel-roth"),
     ]
     lots: list[AuctionLot] = []
     seen_urls: set[str] = set()
@@ -2596,8 +2635,10 @@ def scrape_barnebys(session: requests.Session) -> list[AuctionLot]:
 
     BASE = "https://www.barnebys.com"
     queries = [
-        ("FP Journe",  "fp journe"),
-        ("De Bethune", "de bethune"),
+        ("FP Journe",      "fp journe"),
+        ("De Bethune",     "de bethune"),
+        ("Greubel Forsey", "greubel forsey"),
+        ("Daniel Roth",    "daniel roth"),
     ]
     lots: list[AuctionLot] = []
     seen_urls: set[str] = set()
@@ -2761,12 +2802,16 @@ def scrape_liveauctioneers(session: requests.Session) -> list[AuctionLot]:
     PAGE_SIZE = 24
 
     queries = [
-        ("FP Journe",  "fp journe"),
-        ("De Bethune", "de bethune"),
+        ("FP Journe",      "fp journe"),
+        ("De Bethune",     "de bethune"),
+        ("Greubel Forsey", "greubel forsey"),
+        ("Daniel Roth",    "daniel roth"),
     ]
     _brand_re = {
-        "FP Journe":  re.compile(r"journe", re.IGNORECASE),
-        "De Bethune": re.compile(r"bethune", re.IGNORECASE),
+        "FP Journe":      re.compile(r"journe",       re.IGNORECASE),
+        "De Bethune":     re.compile(r"bethune",       re.IGNORECASE),
+        "Greubel Forsey": re.compile(r"greubel",       re.IGNORECASE),
+        "Daniel Roth":    re.compile(r"daniel\s*roth", re.IGNORECASE),
     }
 
     lots: list[AuctionLot] = []
@@ -3038,14 +3083,13 @@ def gather_all(
             stats.append({
                 "source": name,
                 "count":  len(results),
-                "fpj":    sum(1 for r in results if r.brand == "FP Journe"),
-                "db":     sum(1 for r in results if r.brand == "De Bethune"),
+                **{BRAND_STAT_KEY[b]: sum(1 for r in results if r.brand == b) for b in BRANDS},
                 "error":  None,
             })
             log.info("   → %d listings (%d after global dedup)", len(results), len(new))
         except Exception as exc:
             log.error("Scraper %s crashed: %s", name, exc)
-            stats.append({"source": name, "count": 0, "fpj": 0, "db": 0, "error": str(exc)})
+            stats.append({"source": name, "count": 0, **{BRAND_STAT_KEY[b]: 0 for b in BRANDS}, "error": str(exc)})
 
     # Auction house scrapers — return AuctionLot, not Listing
     auction_scrapers = [
@@ -3071,14 +3115,13 @@ def gather_all(
             stats.append({
                 "source": label,
                 "count":  len(lots),
-                "fpj":    sum(1 for l in lots if l.brand == "FP Journe"),
-                "db":     sum(1 for l in lots if l.brand == "De Bethune"),
+                **{BRAND_STAT_KEY[b]: sum(1 for l in lots if l.brand == b) for b in BRANDS},
                 "error":  None,
             })
             log.info("   → %d upcoming lot(s)", len(lots))
         except Exception as exc:
             log.error("%s scraper crashed: %s", auction_name, exc)
-            stats.append({"source": label, "count": 0, "fpj": 0, "db": 0, "error": str(exc)})
+            stats.append({"source": label, "count": 0, **{BRAND_STAT_KEY[b]: 0 for b in BRANDS}, "error": str(exc)})
 
     all_listings = cross_platform_dedup(all_listings)
     return all_listings, auction_lots, stats
@@ -3088,19 +3131,19 @@ def print_console_summary(
     listings: list[Listing], auction_lots: list[AuctionLot], stats: list[dict]
 ) -> None:
     """Print a readable summary table to stdout — always shown in dev mode."""
-    fpj = [l for l in listings if l.brand == "FP Journe"]
-    db  = [l for l in listings if l.brand == "De Bethune"]
     w = 60
     bar = "=" * w
     print(f"\n{bar}")
     print(f"  Watch Listings -- {date.today():%B %d, %Y}")
-    print(f"  {len(listings)} total  ({len(fpj)} FP Journe / {len(db)} De Bethune)")
+    counts = "  /  ".join(f"{sum(1 for l in listings if l.brand == b)} {BRAND_DISPLAY[b]}" for b in BRANDS if any(l.brand == b for l in listings))
+    print(f"  {len(listings)} total  ({counts})")
     print(bar)
 
-    for brand_name, brand_listings in [("F.P. Journe", fpj), ("De Bethune", db)]:
+    for brand in BRANDS:
+        brand_listings = [l for l in listings if l.brand == brand]
         if not brand_listings:
             continue
-        print(f"\n  {brand_name} ({len(brand_listings)})")
+        print(f"\n  {BRAND_DISPLAY[brand]} ({len(brand_listings)})")
         print("  " + "-" * (w - 2))
         for l in brand_listings:
             title = l.title if len(l.title) <= 44 else l.title[:41] + "…"
@@ -3255,7 +3298,7 @@ def auction_table_html(lots: list[AuctionLot]) -> str:
 
 def stats_table_html(stats: list[dict], brand: str) -> str:
     """Render the source breakdown table filtered to one brand's counts."""
-    brand_key = "fpj" if brand == "FP Journe" else "db"
+    brand_key = BRAND_STAT_KEY.get(brand, brand.lower().replace(" ", "_"))
     rows = []
     for s in stats:
         n = s.get(brand_key, s.get("count", 0))
@@ -3285,8 +3328,18 @@ def stats_table_html(stats: list[dict], brand: str) -> str:
 
 # Brand display names used in subjects and headers
 BRAND_DISPLAY = {
-    "FP Journe":  "F.P. Journe",
-    "De Bethune": "De Bethune",
+    "FP Journe":      "F.P. Journe",
+    "De Bethune":     "De Bethune",
+    "Greubel Forsey": "Greubel Forsey",
+    "Daniel Roth":    "Daniel Roth",
+}
+
+# Short keys used in stats dicts for per-brand counts
+BRAND_STAT_KEY = {
+    "FP Journe":      "fpj",
+    "De Bethune":     "db",
+    "Greubel Forsey": "gf",
+    "Daniel Roth":    "dr",
 }
 
 
@@ -3357,7 +3410,7 @@ def new_listings_html(new_listings: list["Listing"]) -> str:
 
 
 def build_email(
-    brand: str,                    # "FP Journe" or "De Bethune"
+    brand: str,                    # one of BRANDS
     listings: list[Listing],
     auction_lots: list[AuctionLot],
     stats: list[dict],
@@ -3371,7 +3424,7 @@ def build_email(
     n_list       = len(b_listings)
     n_lots       = len(b_lots)
     n_new        = len(b_new)
-    brand_key    = "fpj" if brand == "FP Journe" else "db"
+    brand_key    = BRAND_STAT_KEY.get(brand, brand.lower().replace(" ", "_"))
     active_src   = sum(1 for s in stats if s.get(brand_key, s.get("count", 0)) > 0)
 
     subject = (
@@ -3647,7 +3700,7 @@ def _build_alert_email(
 
   <div style="margin-top:36px;padding-top:16px;border-top:1px solid #e8e8e8;font-size:12px;color:#bbb;">
     <a href="https://auctionmonitoring.netlify.app"
-       style="color:#888;text-decoration:none;">View all upcoming F.P. Journe &amp; De Bethune auctions &rarr;</a><br>
+       style="color:#888;text-decoration:none;">View all upcoming auctions &rarr;</a><br>
     <span style="font-size:11px;">
       Monitored: Phillips &middot; Sotheby&rsquo;s &middot; Christie&rsquo;s &middot;
       Loupe This &middot; Invaluable &middot; Barnebys &middot; LiveAuctioneers &middot; Antiquorum
@@ -3910,8 +3963,8 @@ def send_auction_close_reminders() -> int:
 def send_emails(
     listings: list[Listing], auction_lots: list[AuctionLot], stats: list[dict]
 ) -> None:
-    """Send one email per brand — F.P. Journe first, then De Bethune."""
-    for brand in ("FP Journe", "De Bethune"):
+    """Send one email per brand in BRANDS order."""
+    for brand in BRANDS:
         subject, plain, html = build_email(brand, listings, auction_lots, stats)
         resend.Emails.send({
             "from": RESEND_FROM,
@@ -3929,7 +3982,7 @@ def send_emails(
 # ── Entry Point ────────────────────────────────────────────────────────────────
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Watch Listing Monitor — FP Journe & De Bethune pre-owned tracker",
+        description="Watch Listing Monitor — FP Journe, De Bethune, Greubel Forsey & Daniel Roth pre-owned tracker",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -4061,7 +4114,8 @@ if __name__ == "__main__":
     if args.preview:
         base = pathlib.Path(args.out)
         stem, suffix = base.stem, base.suffix
-        for brand, slug in [("FP Journe", "fpj"), ("De Bethune", "db")]:
+        for brand in BRANDS:
+            slug = BRAND_STAT_KEY[brand]
             _, _, html = build_email(brand, listings, auction_lots, stats)
             out_path = base.with_name(f"{stem}-{slug}{suffix}").resolve()
             out_path.write_text(html, encoding="utf-8")
