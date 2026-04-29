@@ -2459,6 +2459,120 @@ def scrape_antiquorum(session: requests.Session) -> list[AuctionLot]:
     return lots
 
 
+# ── Loupe This ─────────────────────────────────────────────────────────────────
+def scrape_loupethis(session: requests.Session) -> list[AuctionLot]:
+    """
+    Loupe This curated watch auction platform — active lots only.
+
+    Strategy: fetch /brands/{slug} for each brand. Loupe This is Next.js
+    SSR — the full auction list is embedded in __NEXT_DATA__ JSON, so plain
+    requests works (no Playwright needed).
+
+    Relevant fields per lot:
+      id, title, slug, lot, startsAt, endsAt,
+      currentBidPriceCents, featuredImageUrl, isClosed
+    Lot URL: https://www.loupethis.com/auctions/{slug}
+    No estimate — live auction, so we store current bid as estimate_low only.
+    """
+    import json as _json
+    from datetime import datetime, timezone
+
+    BASE = "https://www.loupethis.com"
+    brands = [
+        ("FP Journe",  "f-p-journe"),
+        ("De Bethune", "de-bethune"),
+    ]
+    lots: list[AuctionLot] = []
+    seen_urls: set[str] = set()
+
+    for brand, slug in brands:
+        url = f"{BASE}/brands/{slug}"
+        resp = fetch(url, session)
+        if not resp:
+            log.warning("Loupe This %s: page unreachable", brand)
+            continue
+
+        # Extract __NEXT_DATA__ JSON
+        m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', resp.text, re.DOTALL)
+        if not m:
+            log.warning("Loupe This %s: __NEXT_DATA__ not found", brand)
+            continue
+
+        try:
+            data = _json.loads(m.group(1))
+        except Exception as exc:
+            log.warning("Loupe This %s: JSON parse error: %s", brand, exc)
+            continue
+
+        auctions_map: dict = (
+            data.get("props", {})
+                .get("initialState", {})
+                .get("auctions", {})
+                .get("list", {})
+        )
+
+        page_lots = [v for v in auctions_map.values() if isinstance(v, dict)]
+        log.info("Loupe This %s: %d lot(s) in __NEXT_DATA__", brand, len(page_lots))
+
+        for lot in page_lots:
+            if lot.get("isClosed"):
+                continue
+
+            lot_slug = lot.get("slug", "")
+            lot_url = f"{BASE}/auctions/{lot_slug}" if lot_slug else ""
+            if not lot_url or lot_url in seen_urls:
+                continue
+            seen_urls.add(lot_url)
+
+            title = lot.get("title") or "Unknown"
+            if not is_watch_lot(title):
+                continue
+
+            # Dates — ISO timestamps
+            starts_at = lot.get("startsAt") or ""
+            ends_at   = lot.get("endsAt")   or ""
+            sale_date = "—"
+            sale_date_end_iso = None
+            for iso_str in (starts_at, ends_at):
+                if iso_str:
+                    try:
+                        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+                        sale_date = f"{dt.strftime('%b')} {dt.day}, {dt.year}"
+                        break
+                    except Exception:
+                        pass
+            if ends_at:
+                try:
+                    dt = datetime.fromisoformat(ends_at.replace("Z", "+00:00"))
+                    sale_date_end_iso = dt.date().isoformat()
+                except Exception:
+                    pass
+
+            # Current bid in cents → dollars (no traditional estimate on live auctions)
+            current_bid_cents = lot.get("currentBidPriceCents") or 0
+            current_bid = current_bid_cents / 100.0 if current_bid_cents else None
+
+            lots.append(AuctionLot(
+                title=title,
+                estimate=f"${current_bid:,.0f} (current bid)" if current_bid else "—",
+                sale_date=sale_date,
+                sale_location="Online",
+                image_url=lot.get("featuredImageUrl") or None,
+                lot_url=lot_url,
+                brand=brand,
+                auction_house="Loupe This",
+                sale_name="Loupe This",
+                lot_number=str(lot.get("lot") or ""),
+                estimate_low=current_bid,
+                estimate_high=None,
+                currency="USD",
+                sale_date_end=sale_date_end_iso,
+            ))
+
+    log.info("Loupe This total: %d lot(s)", len(lots))
+    return lots
+
+
 # ── Barnebys ───────────────────────────────────────────────────────────────────
 def scrape_barnebys(session: requests.Session) -> list[AuctionLot]:
     """
@@ -2938,6 +3052,7 @@ def gather_all(
         ("Phillips",          scrape_phillips),
         ("Sotheby's",         scrape_sothebys),
         ("Christie's",        scrape_christies),
+        ("Loupe This",        scrape_loupethis),
         ("Barnebys",          scrape_barnebys),
         ("LiveAuctioneers",   scrape_liveauctioneers),
         ("Invaluable",        scrape_invaluable),
@@ -3535,7 +3650,7 @@ def _build_alert_email(
        style="color:#888;text-decoration:none;">View all upcoming F.P. Journe &amp; De Bethune auctions &rarr;</a><br>
     <span style="font-size:11px;">
       Monitored: Phillips &middot; Sotheby&rsquo;s &middot; Christie&rsquo;s &middot;
-      Invaluable &middot; Barnebys &middot; LiveAuctioneers &middot; Antiquorum
+      Loupe This &middot; Invaluable &middot; Barnebys &middot; LiveAuctioneers &middot; Antiquorum
     </span>
   </div>
 
@@ -3876,9 +3991,10 @@ if __name__ == "__main__":
         print("Available sources (use any substring with --source):")
         for name, _ in SCRAPERS:
             print(f"  {name}")
-        print("  Phillips    (auction lots)")
-        print("  Sotheby's   (auction lots)")
-        print("  Christie's  (auction lots)")
+        print("  Phillips       (auction lots)")
+        print("  Sotheby's      (auction lots)")
+        print("  Christie's     (auction lots)")
+        print("  Loupe This     (auction lots)")
         sys.exit(0)
 
     # --source alone implies no email (dev / debug mode)
@@ -3905,7 +4021,7 @@ if __name__ == "__main__":
         all_auction_lots: list[AuctionLot] = []
         all_stats: list[dict] = []
         successful_houses: set[str] = set()
-        for house, fn in [("Phillips", scrape_phillips), ("Sotheby's", scrape_sothebys), ("Christie's", scrape_christies), ("Barnebys", scrape_barnebys), ("LiveAuctioneers", scrape_liveauctioneers), ("Invaluable", scrape_invaluable), ("Antiquorum", scrape_antiquorum)]:
+        for house, fn in [("Phillips", scrape_phillips), ("Sotheby's", scrape_sothebys), ("Christie's", scrape_christies), ("Loupe This", scrape_loupethis), ("Barnebys", scrape_barnebys), ("LiveAuctioneers", scrape_liveauctioneers), ("Invaluable", scrape_invaluable), ("Antiquorum", scrape_antiquorum)]:
             log.info("── Scraping %s (auction lots) …", house)
             try:
                 lots = fn(session)
