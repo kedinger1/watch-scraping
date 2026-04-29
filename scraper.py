@@ -2564,8 +2564,7 @@ def scrape_loupethis(session: requests.Session) -> list[AuctionLot]:
             seen_urls.add(lot_url)
 
             title = lot.get("title") or "Unknown"
-            if not is_watch_lot(title):
-                continue
+            # No is_watch_lot() check — Loupe This is a watch-only platform
 
             # Dates — ISO timestamps
             starts_at = lot.get("startsAt") or ""
