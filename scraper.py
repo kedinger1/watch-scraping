@@ -3935,7 +3935,9 @@ if __name__ == "__main__":
     # Persist to Supabase (only when running a full scrape or in CI)
     if not args.source:
         save_to_supabase(listings)
-        save_auction_lots_to_supabase(auction_lots)
+        # Auction lots are managed exclusively by the --auctions-only weekly job.
+        # Calling save here would mark all existing lots inactive (auction_lots is
+        # always empty in the daily run since include_auctions=False skips them).
 
     if skip_email:
         print_console_summary(listings, auction_lots, stats)
