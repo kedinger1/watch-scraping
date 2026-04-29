@@ -2543,14 +2543,24 @@ def scrape_loupethis(session: requests.Session) -> list[AuctionLot]:
             log.warning("Loupe This %s: JSON parse error: %s", brand, exc)
             continue
 
-        auctions_map: dict = (
-            data.get("props", {})
-                .get("initialState", {})
-                .get("auctions", {})
-                .get("list", {})
+        props = data.get("props", {})
+        # Active lots: props.pageProps.initialActiveAuctions.data (confirmed Apr 2026)
+        # Fallback: props.initialState.auctions.list (older layout)
+        active_list = (
+            props.get("pageProps", {})
+                 .get("initialActiveAuctions", {})
+                 .get("data", [])
         )
+        if active_list:
+            page_lots = active_list if isinstance(active_list, list) else list(active_list.values())
+        else:
+            auctions_map = (
+                props.get("initialState", {})
+                     .get("auctions", {})
+                     .get("list", {})
+            )
+            page_lots = [v for v in auctions_map.values() if isinstance(v, dict)]
 
-        page_lots = [v for v in auctions_map.values() if isinstance(v, dict)]
         log.info("Loupe This %s: %d lot(s) in __NEXT_DATA__", brand, len(page_lots))
 
         for lot in page_lots:
