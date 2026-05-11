@@ -1645,6 +1645,32 @@ def _sothebys_sale_dates(session: requests.Session, sale_slug: str, base: str) -
         return "TBA", None
 
 
+def _sothebys_get_current_bid(session: requests.Session, lot_url: str) -> tuple[float | None, int, bool]:
+    """
+    Fetch a Sotheby's individual lot page and extract the current bid from
+    the Apollo GraphQL cache embedded in __NEXT_DATA__.
+    Returns (current_bid_amount, number_of_bids, reserve_met).
+    """
+    resp = fetch(lot_url, session)
+    if not resp or resp.status_code != 200:
+        return None, 0, False
+    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', resp.text, re.DOTALL)
+    if not m:
+        return None, 0, False
+    try:
+        nd = json.loads(m.group(1))
+        cache = nd.get("props", {}).get("pageProps", {}).get("apolloCache", {})
+        for key, val in cache.items():
+            if key.startswith("BidState:") and isinstance(val, dict):
+                bid_obj = val.get("currentBidV2") or {}
+                amount_str = bid_obj.get("amount") if isinstance(bid_obj, dict) else None
+                if amount_str:
+                    return float(amount_str), int(val.get("numberOfBids") or 0), bool(val.get("reserveMet", False))
+    except Exception as exc:
+        log.warning("Sotheby's lot bid parse error (%s): %s", lot_url, exc)
+    return None, 0, False
+
+
 def scrape_sothebys(session: requests.Session) -> list[AuctionLot]:
     """
     Sotheby's auction lot scraper.
@@ -1753,6 +1779,14 @@ def scrape_sothebys(session: requests.Session) -> list[AuctionLot]:
                 lot_url = BASE + lot_path if lot_path.startswith("/") else f"{BASE}/{lot_path}"
             else:
                 lot_url = url
+
+            # Fetch current bid from the lot page (active auctions show live bid > estimate)
+            current_bid, n_bids, reserve_met = _sothebys_get_current_bid(session, lot_url)
+            if current_bid and current_bid > 0:
+                bid_str = f"{sign}{int(current_bid):,}"
+                reserve_str = " · Reserve met" if reserve_met else ""
+                bids_str    = f" ({n_bids} bid{'s' if n_bids != 1 else ''})" if n_bids else ""
+                estimate = f"{estimate} · Current bid: {bid_str}{bids_str}{reserve_str}"
 
             # Derive sale slug from lot path: /en/buy/auction/YEAR/SALE-NAME/lot-slug
             # → "YEAR/SALE-NAME"
